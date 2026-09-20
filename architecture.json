@@ -1,0 +1,16 @@
+{
+  "serverRoot": "app/src/server",
+  "serverModule": "nucleagent-im",
+  "enforceAddonImports": true,
+  "coreFiles": [
+    "app/src/server/main.go",
+    "app/src/server/addons/addons.go",
+    "app/src/server/addons/im/plugin.go",
+    "app/src/server/addons/im/token.go",
+    "app/src/server/addons/im/im_test.go"
+  ],
+  "composition": {
+    "app/src/server/main.go": ["github.com/kwhitestone/prism-fusion/addons", "nucleagent-im/addons"]
+  },
+  "forbiddenImports": ["nucleagent-core", "nucleagent-executor", "github.com/kwhitestone/nucleagent-deliverables"]
+}
