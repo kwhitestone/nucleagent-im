@@ -1,0 +1,29 @@
+system:
+  env: 'local'
+  addr: 26655
+
+jwt:
+  signing-key: '${JWT_SECRET}'
+  expires-time: '15m'
+  refresh-expires-time: '168h'
+  refresh-family-expires-time: '720h'
+  refresh-rotation-grace: '60s'
+  buffer-time: '5m'
+  issuer: 'nucleagent-auth'
+
+zap:
+  level: 'info'
+  prefix: '[NUCLEAGENT-IM]'
+  format: 'console'
+  director: 'log'
+  encode-level: 'LowercaseColorLevelEncoder'
+  stacktrace-key: 'stacktrace'
+  max-age: 0
+  show-line: true
+  log-in-console: true
+
+wukongim:
+  ws-addr: '${WUKONGIM_WS_ADDR:-ws://127.0.0.1:26652}'
+
+im:
+  connect-token-secret: '${IM_CONNECT_TOKEN_SECRET}'

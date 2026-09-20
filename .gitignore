@@ -1,0 +1,16 @@
+nucleagent-im
+nucleagent-im-*
+nucleagent-im.exe
+app/src/server/nucleagent-im
+app/src/server/vendor/
+*.local.yaml
+*.local.env
+.env
+.env.local
+log/
+*.log
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

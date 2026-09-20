@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "dependencies": [
+    {
+      "name": "prism-fusion",
+      "repository": "kwhitestone/prism-fusion",
+      "commit": "0277ac68c5a70abf3d84a7276f088aadf217e80a",
+      "role": "runtime",
+      "goModules": [
+        {
+          "module": "github.com/kwhitestone/prism-fusion",
+          "path": "src/server"
+        }
+      ]
+    }
+  ]
+}
