@@ -1,8 +1,12 @@
 package im
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,8 +23,9 @@ import (
 
 type Plugin struct {
 	plugin.BasePlugin
-	signer *tokenSigner
-	wsAddr string
+	signer  *tokenSigner
+	apiAddr string
+	wsAddr  string
 }
 
 type contextKey int
@@ -49,6 +54,30 @@ type HealthOutput struct {
 }
 
 type ConnectOutput struct {
+	Body any
+}
+
+type ConversationListInput struct {
+	Body struct {
+		Cursor            string `json:"cursor,omitempty"`
+		Limit             int    `json:"limit,omitempty"`
+		CompletedCoverage int64  `json:"completed_coverage,omitempty"`
+	}
+}
+
+type MessageSyncInput struct {
+	Body struct {
+		ChannelID       string `json:"channel_id" required:"true"`
+		ChannelType     uint8  `json:"channel_type" minimum:"1"`
+		StartMessageSeq uint64 `json:"start_message_seq,omitempty"`
+		EndMessageSeq   uint64 `json:"end_message_seq,omitempty"`
+		PullMode        int    `json:"pull_mode,omitempty"`
+		Limit           int    `json:"limit,omitempty"`
+		StreamV2        int    `json:"stream_v2,omitempty"`
+	}
+}
+
+type ProxyOutput struct {
 	Body any
 }
 
@@ -87,7 +116,13 @@ func (p *Plugin) Initialize(context.Context) error {
 	if err != nil || (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" {
 		return errors.New("wukongim.ws-addr must be a valid ws or wss URL")
 	}
+	apiAddr := configValue("WUKONGIM_API_ADDR", "wukongim.api-addr", "http://127.0.0.1:26651")
+	parsed, err = url.Parse(apiAddr)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return errors.New("wukongim.api-addr must be a valid http or https URL")
+	}
 	p.signer = signer
+	p.apiAddr = strings.TrimRight(apiAddr, "/")
 	p.wsAddr = wsAddr
 	return nil
 }
@@ -123,11 +158,92 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 		if err != nil {
 			return nil, huma.NewError(http.StatusInternalServerError, "failed to mint connect token")
 		}
+		if err := registerToken(ctx, p.apiAddr, uid, token); err != nil {
+			return nil, huma.NewError(http.StatusBadGateway, "failed to register connect token")
+		}
 		return &ConnectOutput{Body: envelope[ConnectData]{
 			Code: 0, Message: "success",
 			Data: ConnectData{UID: uid, Token: token, WSAddr: p.wsAddr},
 		}}, nil
 	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "imConversationList",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/im/conversation/list",
+		Summary:     "List WuKongIM conversations",
+		Tags:        []string{"IM"},
+		Security:    []map[string][]string{{"AuthTokenAuth": {}}},
+	}, func(ctx context.Context, input *ConversationListInput) (*ProxyOutput, error) {
+		body := map[string]any{
+			"uid":                strconv.FormatUint(uint64(ctx.Value(userIDKey).(uint)), 10),
+			"cursor":             input.Body.Cursor,
+			"limit":              input.Body.Limit,
+			"completed_coverage": input.Body.CompletedCoverage,
+		}
+		return p.proxy(ctx, "/conversation/list", body)
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "imChannelMessageSync",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/im/channel/messagesync",
+		Summary:     "Sync WuKongIM channel messages",
+		Tags:        []string{"IM"},
+		Security:    []map[string][]string{{"AuthTokenAuth": {}}},
+	}, func(ctx context.Context, input *MessageSyncInput) (*ProxyOutput, error) {
+		body := map[string]any{
+			"login_uid":         strconv.FormatUint(uint64(ctx.Value(userIDKey).(uint)), 10),
+			"channel_id":        input.Body.ChannelID,
+			"channel_type":      input.Body.ChannelType,
+			"start_message_seq": input.Body.StartMessageSeq,
+			"end_message_seq":   input.Body.EndMessageSeq,
+			"pull_mode":         input.Body.PullMode,
+			"limit":             input.Body.Limit,
+			"stream_v2":         input.Body.StreamV2,
+		}
+		return p.proxy(ctx, "/channel/messagesync", body)
+	})
+}
+
+func registerToken(ctx context.Context, apiAddr, uid, token string) error {
+	return postWuKong(ctx, apiAddr, "/user/token", map[string]any{
+		"uid": uid, "token": token, "device_flag": 1, "device_level": 1,
+	}, nil)
+}
+
+func (p *Plugin) proxy(ctx context.Context, path string, body any) (*ProxyOutput, error) {
+	var output any
+	if err := postWuKong(ctx, p.apiAddr, path, body, &output); err != nil {
+		return nil, huma.NewError(http.StatusBadGateway, "wukongim request failed")
+	}
+	return &ProxyOutput{Body: output}, nil
+}
+
+func postWuKong(ctx context.Context, apiAddr, path string, input, output any) error {
+	body, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, apiAddr+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return fmt.Errorf("wukongim request returned %s", response.Status)
+	}
+	if output == nil {
+		_, _ = io.Copy(io.Discard, response.Body)
+		return nil
+	}
+	return json.NewDecoder(response.Body).Decode(output)
 }
 
 func JWTMiddleware() gin.HandlerFunc {

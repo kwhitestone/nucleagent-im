@@ -1,6 +1,7 @@
 package im
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,6 +54,50 @@ func TestExpiredConnectTokenRejected(t *testing.T) {
 	}
 	if _, err := signer.Verify(token, now); err == nil {
 		t.Fatal("expired token was accepted")
+	}
+}
+
+func TestRegisterToken(t *testing.T) {
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/user/token" {
+			t.Fatalf("path = %q, want /user/token", request.URL.Path)
+		}
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	if err := registerToken(t.Context(), server.URL, "42", "token-42"); err != nil {
+		t.Fatal(err)
+	}
+	for field, want := range map[string]any{
+		"uid": "42", "token": "token-42", "device_flag": float64(1), "device_level": float64(1),
+	} {
+		if received[field] != want {
+			t.Fatalf("%s = %#v, want %#v", field, received[field], want)
+		}
+	}
+}
+
+func TestPostWuKong(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/conversation/list" {
+			t.Fatalf("path = %q, want /conversation/list", request.URL.Path)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"conversations":[]}`))
+	}))
+	defer server.Close()
+
+	var output map[string]any
+	if err := postWuKong(t.Context(), server.URL, "/conversation/list", map[string]any{"uid": "42"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if conversations, ok := output["conversations"].([]any); !ok || len(conversations) != 0 {
+		t.Fatalf("output = %#v, want empty conversations", output)
 	}
 }
 

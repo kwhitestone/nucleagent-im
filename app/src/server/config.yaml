@@ -23,6 +23,7 @@ zap:
   log-in-console: true
 
 wukongim:
+  api-addr: '${WUKONGIM_API_ADDR:-http://127.0.0.1:26651}'
   ws-addr: '${WUKONGIM_WS_ADDR:-ws://127.0.0.1:26652}'
 
 im:
