@@ -26,6 +26,7 @@ type Plugin struct {
 	plugin.BasePlugin
 	signer              *tokenSigner
 	apiAddr             string
+	managerAddr         string
 	wsAddr              string
 	coreURL             string
 	webhookCapability   string
@@ -155,8 +156,14 @@ func (p *Plugin) Initialize(context.Context) error {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return errors.New("wukongim.api-addr must be a valid http or https URL")
 	}
+	managerAddr := configValue("WUKONGIM_MANAGER_ADDR", "wukongim.manager-addr", "http://127.0.0.1:26654")
+	parsed, err = url.Parse(managerAddr)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return errors.New("wukongim.manager-addr must be a valid http or https URL")
+	}
 	p.signer = signer
 	p.apiAddr = strings.TrimRight(apiAddr, "/")
+	p.managerAddr = strings.TrimRight(managerAddr, "/")
 	p.wsAddr = wsAddr
 	p.webhookCapability = configValue("IM_WEBHOOK_CAPABILITY", "im.webhook-capability", "")
 	if len(p.webhookCapability) < 32 || strings.Contains(p.webhookCapability, "${") {
@@ -225,6 +232,7 @@ func (p *Plugin) Stop(ctx context.Context) error {
 func (p *Plugin) RegisterRoutes(api huma.API) {
 	p.registerWebhook(api)
 	p.registerAgentStreams(api)
+	p.registerGroups(api)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "imHealth",
@@ -250,10 +258,10 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 		uid := strconv.FormatUint(uint64(ctx.Value(userIDKey).(uint)), 10)
 		token, err := p.signer.Mint(uid, time.Now())
 		if err != nil {
-			return nil, huma.NewError(http.StatusInternalServerError, "failed to mint connect token")
+			return nil, newIMProblem(http.StatusInternalServerError, "internal_error", "failed to mint connect token")
 		}
 		if err := registerToken(ctx, p.apiAddr, uid, token); err != nil {
-			return nil, huma.NewError(http.StatusBadGateway, "failed to register connect token")
+			return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "WuKongIM is unavailable")
 		}
 		return &ConnectOutput{Body: envelope[ConnectData]{
 			Code: 0, Message: "success",
@@ -309,7 +317,7 @@ func registerToken(ctx context.Context, apiAddr, uid, token string) error {
 func (p *Plugin) proxy(ctx context.Context, path string, body any) (*ProxyOutput, error) {
 	var output any
 	if err := postWuKong(ctx, p.apiAddr, path, body, &output); err != nil {
-		return nil, huma.NewError(http.StatusBadGateway, "wukongim request failed")
+		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "WuKongIM is unavailable")
 	}
 	return &ProxyOutput{Body: output}, nil
 }
@@ -384,8 +392,11 @@ func JWTMiddleware() gin.HandlerFunc {
 }
 
 func abortUnauthorized(c *gin.Context, message string) {
-	c.AbortWithStatusJSON(http.StatusUnauthorized, envelope[any]{
-		Code: http.StatusUnauthorized, Message: message, Data: nil,
+	c.AbortWithStatusJSON(http.StatusUnauthorized, imProblem{
+		ErrorModel: huma.ErrorModel{
+			Status: http.StatusUnauthorized, Title: http.StatusText(http.StatusUnauthorized), Detail: message,
+		},
+		Code: "authentication_required",
 	})
 }
 

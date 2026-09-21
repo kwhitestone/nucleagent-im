@@ -166,6 +166,13 @@ func TestWebhookGroupMentionsAllowlistAndMultipleAgents(t *testing.T) {
 	if count := inboxCount(t, db); count != 3 {
 		t.Fatalf("inbox count=%d, want 3", count)
 	}
+	var memberRow IMWebhookInbox
+	if err := db.Where("message_idstr = ? AND target_agent_uid = ?", "201", 42).First(&memberRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if memberRow.SenderUID != 2 || memberRow.ExecutionOwnerUserID != 1 {
+		t.Fatalf("initiator=%d execution owner=%d", memberRow.SenderUID, memberRow.ExecutionOwnerUserID)
+	}
 }
 
 func TestWebhookRateLimitBoundaries(t *testing.T) {

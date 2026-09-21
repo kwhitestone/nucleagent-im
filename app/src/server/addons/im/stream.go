@@ -154,14 +154,14 @@ func (p *Plugin) registerAgentStreams(api huma.API) {
 	}, func(ctx context.Context, input *agentStreamInput) (*huma.StreamResponse, error) {
 		userID, _ := ctx.Value(userIDKey).(uint)
 		if userID == 0 || strings.TrimSpace(input.ChannelID) == "" {
-			return nil, huma.NewError(http.StatusBadRequest, "invalid channel")
+			return nil, newIMProblem(http.StatusBadRequest, "invalid_channel", "invalid channel")
 		}
 		allowed, err := p.channelParticipant(ctx, userID, input.ChannelID, input.ChannelType)
 		if err != nil {
-			return nil, huma.NewError(http.StatusServiceUnavailable, "channel membership unavailable")
+			return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "channel membership is unavailable")
 		}
 		if !allowed {
-			return nil, huma.NewError(http.StatusForbidden, "channel participant required")
+			return nil, newIMProblem(http.StatusForbidden, "channel_forbidden", "channel membership is required")
 		}
 		channelID := input.ChannelID
 		channelType := input.ChannelType

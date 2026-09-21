@@ -37,6 +37,7 @@ zap:
 wukongim:
   # Deploy with the in-cluster WuKongIM Service DNS; localhost is for local development.
   api-addr: '${WUKONGIM_API_ADDR:-http://127.0.0.1:26651}'
+  manager-addr: '${WUKONGIM_MANAGER_ADDR:-http://127.0.0.1:26654}'
   ws-addr: '${WUKONGIM_WS_ADDR:-ws://127.0.0.1:26652}'
 
 im:
