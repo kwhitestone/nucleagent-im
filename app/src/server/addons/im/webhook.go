@@ -31,14 +31,26 @@ const (
 
 var errAgentRateLimited = errors.New("agent rate limit exceeded")
 
+type webhookHeader struct {
+	NoPersist uint8 `json:"no_persist"`
+	RedDot    uint8 `json:"red_dot"`
+	SyncOnce  uint8 `json:"sync_once"`
+}
+
 type webhookMessage struct {
-	MessageIDStr string `json:"message_idstr"`
-	ClientMsgNo  string `json:"client_msg_no"`
-	FromUID      string `json:"from_uid"`
-	ChannelID    string `json:"channel_id"`
-	ChannelType  uint8  `json:"channel_type"`
-	Timestamp    int64  `json:"timestamp"`
-	RawPayload   []byte `json:"payload"`
+	Header       *webhookHeader `json:"header,omitempty"`
+	Setting      uint8          `json:"setting,omitempty"`
+	Topic        string         `json:"topic,omitempty"`
+	Expire       int64          `json:"expire,omitempty"`
+	MessageID    int64          `json:"message_id,omitempty"`
+	MessageSeq   int64          `json:"message_seq,omitempty"`
+	MessageIDStr string         `json:"message_idstr"`
+	ClientMsgNo  string         `json:"client_msg_no"`
+	FromUID      string         `json:"from_uid"`
+	ChannelID    string         `json:"channel_id"`
+	ChannelType  uint8          `json:"channel_type"`
+	Timestamp    int64          `json:"timestamp"`
+	RawPayload   []byte         `json:"payload"`
 }
 
 type textPayload struct {
