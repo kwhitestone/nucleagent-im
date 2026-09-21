@@ -11,6 +11,18 @@ jwt:
   buffer-time: '5m'
   issuer: 'nucleagent-auth'
 
+mysql:
+  host: '${DB_HOST}'
+  port: '${DB_PORT}'
+  db-name: '${DB_NAME}'
+  username: '${DB_USER}'
+  password: '${DB_PASSWORD}'
+  config: 'charset=utf8mb4&parseTime=True&loc=Local'
+  max-idle-conns: 10
+  max-open-conns: 100
+  log-mode: 'error'
+  log-zap: false
+
 zap:
   level: 'info'
   prefix: '[NUCLEAGENT-IM]'
@@ -23,8 +35,16 @@ zap:
   log-in-console: true
 
 wukongim:
+  # Deploy with the in-cluster WuKongIM Service DNS; localhost is for local development.
   api-addr: '${WUKONGIM_API_ADDR:-http://127.0.0.1:26651}'
+  manager-addr: '${WUKONGIM_MANAGER_ADDR:-http://127.0.0.1:26654}'
   ws-addr: '${WUKONGIM_WS_ADDR:-ws://127.0.0.1:26652}'
 
 im:
   connect-token-secret: '${IM_CONNECT_TOKEN_SECRET}'
+  # Generate with: openssl rand -hex 32
+  webhook-capability: '${IM_WEBHOOK_CAPABILITY}'
+  core-url: '${CORE_URL:-http://127.0.0.1:26653}'
+  service-jwt: '${IM_SERVICE_JWT}'
+  wukong-admin-user: '${IM_WUKONG_ADMIN_USER}'
+  wukong-admin-pass: '${IM_WUKONG_ADMIN_PASS}'
