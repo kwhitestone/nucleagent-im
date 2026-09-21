@@ -351,7 +351,7 @@ func TestCoreStreamResumeSnapshotsFinalAndIdempotency(t *testing.T) {
 		Event: "msg.notify", MessageIDStr: "stream", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
 		ExecutionOwnerUserID: 1, SourceKey: "wukong:msg.notify:stream:42",
-		CoreConversationID: 9, LastCoreEventID: "7",
+		CoreConversationID: 9, LastCoreEventID: "7", DispatchCoreMessageID: 7,
 	}
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatal(err)
@@ -401,7 +401,7 @@ func TestCoreStreamRetriesFinalEventAfterWuKongFailure(t *testing.T) {
 		Event: "msg.notify", MessageIDStr: "retry-final", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
 		ExecutionOwnerUserID: 1, SourceKey: "wukong:msg.notify:retry-final:42",
-		CoreConversationID: 9, LastCoreEventID: "7",
+		CoreConversationID: 9, LastCoreEventID: "7", DispatchCoreMessageID: 7,
 	}
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatal(err)
@@ -461,6 +461,7 @@ func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
 		Event: "msg.notify", MessageIDStr: "error", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
 		ExecutionOwnerUserID: 1, SourceKey: "wukong:msg.notify:error:42", CoreConversationID: 9,
+		DispatchCoreMessageID: 7,
 	}
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatal(err)

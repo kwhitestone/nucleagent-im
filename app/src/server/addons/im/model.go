@@ -35,6 +35,7 @@ type IMWebhookInbox struct {
 	CumulativeAnswer       string     `gorm:"type:longtext"`
 	Revision               uint64     `gorm:"not null;default:0"`
 	LastCoreEventID        string     `gorm:"size:64"`
+	DispatchCoreMessageID  uint       `gorm:"not null;default:0"`
 	FinalCoreMessageID     uint
 	FinalWuKongClientMsgNo string `gorm:"size:128"`
 	FinalSentAt            *time.Time
