@@ -21,6 +21,7 @@ type coreMessage struct {
 	SenderType string `json:"senderType"`
 	MsgType    string `json:"msgType"`
 	Content    string `json:"content"`
+	SourceKey  string `json:"sourceKey"`
 }
 
 func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) error {
@@ -57,6 +58,25 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		if json.Unmarshal(data, &message) != nil {
 			return false, persistCoreEventID(row, id)
 		}
+		eventID, err := strconv.ParseUint(id, 10, 64)
+		if err != nil || eventID == 0 || eventID != uint64(message.ID) {
+			return false, errors.New("invalid Core SSE message identity")
+		}
+		// The source message is a fixed dispatch boundary. The resume cursor is
+		// separate because Core updates streaming messages in place at the same ID.
+		if row.DispatchCoreMessageID == 0 {
+			if message.SenderType == "user" && message.SourceKey == row.SourceKey {
+				if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).
+					Update("dispatch_core_message_id", message.ID).Error; err != nil {
+					return false, err
+				}
+				row.DispatchCoreMessageID = message.ID
+			}
+			return false, persistCoreEventID(row, id)
+		}
+		if message.ID <= row.DispatchCoreMessageID {
+			return false, nil
+		}
 		if message.MsgType == "error" {
 			if err := markTerminalFailure(row.ID, "im_execution_failed"); err != nil {
 				return false, err
@@ -71,7 +91,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 			return false, persistCoreEventID(row, id)
 		}
 		switch {
-		case event == "message-updated" && message.MsgType == "streaming":
+		case message.MsgType == "streaming":
 			if err := persistSnapshot(row, message.Content); err != nil {
 				return false, err
 			}

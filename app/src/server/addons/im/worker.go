@@ -158,6 +158,25 @@ func (p *Plugin) processLeased(ctx context.Context, row *IMWebhookInbox) {
 }
 
 func (p *Plugin) dispatchAndStream(ctx context.Context, row *IMWebhookInbox) error {
+	if row.LastCoreEventID == "" {
+		// Seed before publishing, never from a later turn or on a retry. The
+		// stream still waits for this sourceKey before accepting any answer.
+		var previous IMWebhookInbox
+		if err := global.PRISM_DB.Select("last_core_event_id").
+			Where("id < ? AND channel_id = ? AND channel_type = ? AND target_agent_uid = ? AND execution_owner_user_id = ? AND state = ?",
+				row.ID, row.ChannelID, row.ChannelType, row.TargetAgentUID, row.ExecutionOwnerUserID, inboxCompleted).
+			Order("id DESC").Limit(1).Find(&previous).Error; err != nil {
+			return err
+		}
+		cursor := previous.LastCoreEventID
+		if cursor == "" {
+			cursor = "0"
+		}
+		if err := global.PRISM_DB.Model(row).Update("last_core_event_id", cursor).Error; err != nil {
+			return err
+		}
+		row.LastCoreEventID = cursor
+	}
 	history, err := p.initialHistory(ctx, row)
 	if err != nil {
 		return err
