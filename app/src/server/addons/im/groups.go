@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
@@ -563,6 +562,7 @@ func (p *Plugin) groupMembersResponse(
 
 func (p *Plugin) wuKongGroupMembers(ctx context.Context, channelID string) ([]uint, error) {
 	cursor := ""
+	seenCursors := map[string]bool{"": true}
 	var members []uint
 	for {
 		endpoint, err := url.Parse(p.managerAddr + "/manager/channels/2/" +
@@ -571,16 +571,12 @@ func (p *Plugin) wuKongGroupMembers(ctx context.Context, channelID string) ([]ui
 			return nil, err
 		}
 		query := endpoint.Query()
-		query.Set("limit", "1000")
+		query.Set("limit", "500")
 		if cursor != "" {
 			query.Set("cursor", cursor)
 		}
 		endpoint.RawQuery = query.Encode()
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+		response, err := p.managerGet(ctx, endpoint.String())
 		if err != nil {
 			return nil, err
 		}
@@ -603,10 +599,14 @@ func (p *Plugin) wuKongGroupMembers(ctx context.Context, channelID string) ([]ui
 				members = appendUnique(members, uint(uid))
 			}
 		}
-		if !page.HasMore || page.NextCursor == "" || page.NextCursor == cursor {
+		if !page.HasMore {
 			break
 		}
+		if seenCursors[page.NextCursor] {
+			return nil, errors.New("wukong manager returned an invalid pagination cursor")
+		}
 		cursor = page.NextCursor
+		seenCursors[cursor] = true
 	}
 	return members, nil
 }

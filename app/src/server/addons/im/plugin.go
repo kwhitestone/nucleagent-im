@@ -33,6 +33,9 @@ type Plugin struct {
 	serviceJWT          string
 	wuKongAdminUser     string
 	wuKongAdminPassword string
+	managerTokenMu      sync.Mutex
+	managerToken        string
+	managerTokenExpiry  time.Time
 	webhookAdmission    webhookAdmission
 	cancel              context.CancelFunc
 	done                chan struct{}
