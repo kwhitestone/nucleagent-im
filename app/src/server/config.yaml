@@ -2,6 +2,15 @@ system:
   env: 'local'
   addr: 26655
 
+cors:
+  whitelist:
+    # Keep the inherited origin policy; allow cursor-based SSE for this frontend.
+    - allow-origin: '${IM_WEB_FRONTEND_URL}'
+      allow-headers: 'Content-Type,AccessToken,X-CSRF-Token,Authorization,Token,X-Token,X-User-Id,auth_token,x-request-id,X-Request-ID,x-session-id,X-Session-ID,Last-Event-ID'
+      allow-methods: 'POST, GET, OPTIONS, PUT, DELETE, UPDATE'
+      expose-headers: 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Content-Type, New-Token, New-Expires-At'
+      allow-credentials: true
+
 jwt:
   signing-key: '${JWT_SECRET}'
   expires-time: '15m'

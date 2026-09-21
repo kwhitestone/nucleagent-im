@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,8 +65,9 @@ type textPayload struct {
 }
 
 type webhookInput struct {
-	Event string `query:"event"`
-	Body  []webhookMessage
+	Event   string `query:"event"`
+	Body    []webhookMessage
+	RawBody []byte
 }
 
 type webhookData struct {
@@ -119,6 +122,13 @@ func (p *Plugin) registerWebhook(api huma.API) {
 		}
 		if input.Event != "msg.notify" {
 			return nil, newWebhookProblem(http.StatusBadRequest, "im_webhook_event_unsupported", "unsupported webhook event")
+		}
+		// Temporary acceptance capture: authenticated raw bytes, never the capability URL.
+		if os.Getenv("IM_WEBHOOK_DEBUG_BODY") == "1" {
+			body := capabilityLogPattern.ReplaceAllString(string(input.RawBody), "${1}[REDACTED]")
+			body = strings.ReplaceAll(body, p.webhookCapability, "[REDACTED]")
+			slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})).
+				Debug("im_webhook_debug_body", "event", input.Event, "body", body)
 		}
 		accepted, err := acceptWebhookBatch(ctx, global.PRISM_DB, input.Event, input.Body, time.Now())
 		if errors.Is(err, errAgentRateLimited) {

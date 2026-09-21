@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -30,8 +32,13 @@ func TestWebhookHTTPBeta21Envelope(t *testing.T) {
 		edit     func(map[string]any)
 		status   int
 		accepted int
+		debug    bool
 	}{
 		{name: "real envelope", token: capability, status: 200, accepted: 1},
+		{name: "raw capture opt in", token: capability, status: 200, accepted: 1, debug: true},
+		{name: "capture redacts capability", token: capability, status: 200, accepted: 1, debug: true, edit: func(m map[string]any) {
+			m["topic"] = "url?token=" + capability
+		}},
 		{name: "legacy seven fields", token: capability, status: 200, accepted: 1, edit: func(m map[string]any) {
 			for _, key := range []string{"header", "setting", "expire", "message_id", "message_seq"} {
 				delete(m, key)
@@ -40,7 +47,7 @@ func TestWebhookHTTPBeta21Envelope(t *testing.T) {
 		{name: "optional topic", token: capability, status: 200, accepted: 1, edit: func(m map[string]any) {
 			m["topic"] = "topic-a"
 		}},
-		{name: "wrong capability", token: "wrong", status: 401},
+		{name: "wrong capability", token: "wrong", status: 401, debug: true},
 		{name: "missing capability", status: 401},
 		{name: "non text ignored", token: capability, status: 200, payload: `{"type":2,"content":"hello","mention":{"all":0,"uids":["42"]}}`},
 		{name: "agent ignored", token: capability, status: 200, edit: func(m map[string]any) {
@@ -60,6 +67,10 @@ func TestWebhookHTTPBeta21Envelope(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("IM_WEBHOOK_DEBUG_BODY", "")
+			if tc.debug {
+				t.Setenv("IM_WEBHOOK_DEBUG_BODY", "1")
+			}
 			db := m2DB(t)
 			addUser(t, db, 2, authmodel.AccountTypeHuman)
 			addUser(t, db, 42, authmodel.AccountTypeAgent)
@@ -107,7 +118,35 @@ func TestWebhookHTTPBeta21Envelope(t *testing.T) {
 				strings.NewReader("["+body+"]"))
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout := os.Stdout
+			os.Stdout = writer
+			t.Cleanup(func() { os.Stdout = stdout; reader.Close(); writer.Close() })
 			router.ServeHTTP(rec, req)
+			os.Stdout = stdout
+			writer.Close()
+			logged, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.debug && tc.status == http.StatusOK {
+				var record struct {
+					Level string `json:"level"`
+					Body  string `json:"body"`
+				}
+				if err := json.Unmarshal(logged, &record); err != nil {
+					t.Fatal(err)
+				}
+				want := strings.ReplaceAll("["+body+"]", capability, "[REDACTED]")
+				if record.Level != "DEBUG" || record.Body != want || strings.Contains(string(logged), capability) {
+					t.Fatal("capture must retain raw bytes except capability redaction")
+				}
+			} else if len(logged) != 0 {
+				t.Fatal("capture must be opt-in and authenticated")
+			}
 			if rec.Code != tc.status {
 				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
 			}
