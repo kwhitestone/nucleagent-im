@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	if err := core.RunApplication(core.ApplicationOptions{DisableDatabase: true}); err != nil {
+	if err := core.RunApplication(core.ApplicationOptions{}); err != nil {
 		log.Fatal(err)
 	}
 }

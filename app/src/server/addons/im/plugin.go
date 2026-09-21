@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -23,14 +24,43 @@ import (
 
 type Plugin struct {
 	plugin.BasePlugin
-	signer  *tokenSigner
-	apiAddr string
-	wsAddr  string
+	signer              *tokenSigner
+	apiAddr             string
+	wsAddr              string
+	coreURL             string
+	webhookCapability   string
+	serviceJWT          string
+	wuKongAdminUser     string
+	wuKongAdminPassword string
+	webhookAdmission    webhookAdmission
+	cancel              context.CancelFunc
+	done                chan struct{}
+	wg                  sync.WaitGroup
 }
 
 type contextKey int
 
-const userIDKey contextKey = 1
+const (
+	userIDKey            contextKey = 1
+	webhookCapabilityKey contextKey = 2
+)
+
+var (
+	capabilityLogPattern = regexp.MustCompile(`([?&]token=)[^&\s"]+`)
+	installLogRedaction  sync.Once
+)
+
+type capabilityRedactingWriter struct {
+	io.Writer
+}
+
+func (w capabilityRedactingWriter) Write(data []byte) (int, error) {
+	_, err := w.Writer.Write(capabilityLogPattern.ReplaceAll(data, []byte(`${1}<redacted>`)))
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
 
 type envelope[T any] struct {
 	Code    int    `json:"code"`
@@ -104,6 +134,10 @@ func (p *Plugin) Manifest() plugin.Manifest {
 }
 
 func (p *Plugin) Initialize(context.Context) error {
+	installLogRedaction.Do(func() {
+		gin.DefaultWriter = capabilityRedactingWriter{Writer: gin.DefaultWriter}
+		gin.DefaultErrorWriter = capabilityRedactingWriter{Writer: gin.DefaultErrorWriter}
+	})
 	if err := authservice.ValidateTokenConfiguration(); err != nil {
 		return err
 	}
@@ -124,6 +158,28 @@ func (p *Plugin) Initialize(context.Context) error {
 	p.signer = signer
 	p.apiAddr = strings.TrimRight(apiAddr, "/")
 	p.wsAddr = wsAddr
+	p.webhookCapability = configValue("IM_WEBHOOK_CAPABILITY", "im.webhook-capability", "")
+	if len(p.webhookCapability) < 32 || strings.Contains(p.webhookCapability, "${") {
+		return errors.New("IM_WEBHOOK_CAPABILITY must be a non-placeholder secret of at least 32 bytes")
+	}
+	coreURL := configValue("CORE_URL", "im.core-url", "http://127.0.0.1:26653")
+	parsed, err = url.Parse(coreURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return errors.New("CORE_URL must be a valid http or https URL")
+	}
+	p.coreURL = strings.TrimRight(coreURL, "/")
+	p.serviceJWT = configValue("IM_SERVICE_JWT", "im.service-jwt", "")
+	if p.serviceJWT != "" {
+		claims, parseErr := (&authservice.JwtService{}).ParseAccessToken(p.serviceJWT)
+		if parseErr != nil || !claims.IsServicePrincipal() || claims.Username != "nucleagent-im" {
+			return errors.New("IM_SERVICE_JWT must identify service nucleagent-im")
+		}
+	}
+	p.wuKongAdminUser = configValue("IM_WUKONG_ADMIN_USER", "im.wukong-admin-user", "")
+	p.wuKongAdminPassword = configValue("IM_WUKONG_ADMIN_PASS", "im.wukong-admin-pass", "")
+	if (p.wuKongAdminUser == "") != (p.wuKongAdminPassword == "") {
+		return errors.New("IM_WUKONG_ADMIN_USER and IM_WUKONG_ADMIN_PASS must be configured together")
+	}
 	return nil
 }
 
@@ -131,7 +187,45 @@ func (p *Plugin) Middlewares() []gin.HandlerFunc {
 	return []gin.HandlerFunc{JWTMiddleware()}
 }
 
+func (p *Plugin) Models() []interface{} {
+	return []interface{}{
+		&IMWebhookInbox{},
+		&IMCoreConversationMap{},
+		&IMGroup{},
+		&IMGroupAgentAllowlist{},
+		&IMRateWindow{},
+	}
+}
+
+func (p *Plugin) Start(ctx context.Context) error {
+	if global.PRISM_DB == nil {
+		return errors.New("IM database is not initialized")
+	}
+	ctx, p.cancel = context.WithCancel(ctx)
+	p.done = make(chan struct{})
+	go p.runWorker(ctx)
+	return nil
+}
+
+func (p *Plugin) Stop(ctx context.Context) error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	if p.done != nil {
+		select {
+		case <-p.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	p.wg.Wait()
+	return nil
+}
+
 func (p *Plugin) RegisterRoutes(api huma.API) {
+	p.registerWebhook(api)
+	p.registerAgentStreams(api)
+
 	huma.Register(api, huma.Operation{
 		OperationID: "imHealth",
 		Method:      http.MethodGet,
@@ -221,6 +315,10 @@ func (p *Plugin) proxy(ctx context.Context, path string, body any) (*ProxyOutput
 }
 
 func postWuKong(ctx context.Context, apiAddr, path string, input, output any) error {
+	return postWuKongWithAuth(ctx, apiAddr, path, "", "", input, output)
+}
+
+func postWuKongWithAuth(ctx context.Context, apiAddr, path, username, password string, input, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return err
@@ -230,6 +328,9 @@ func postWuKong(ctx context.Context, apiAddr, path string, input, output any) er
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if username != "" || password != "" {
+		request.SetBasicAuth(username, password)
+	}
 	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
 	if err != nil {
 		return err
@@ -237,7 +338,10 @@ func postWuKong(ctx context.Context, apiAddr, path string, input, output any) er
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, response.Body)
-		return fmt.Errorf("wukongim request returned %s", response.Status)
+		return &httpStatusError{
+			status: response.StatusCode,
+			code:   "wukong_http_" + strconv.Itoa(response.StatusCode),
+		}
 	}
 	if output == nil {
 		_, _ = io.Copy(io.Discard, response.Body)
@@ -250,6 +354,17 @@ func JWTMiddleware() gin.HandlerFunc {
 	jwtService := &authservice.JwtService{}
 	return func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/api/v1/im/health" {
+			c.Next()
+			return
+		}
+		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/api/v1/im/webhooks/wukong" {
+			query := c.Request.URL.Query()
+			capability := query.Get("token")
+			query.Del("token")
+			c.Request.URL.RawQuery = query.Encode()
+			c.Request = c.Request.WithContext(context.WithValue(
+				c.Request.Context(), webhookCapabilityKey, capability,
+			))
 			c.Next()
 			return
 		}
