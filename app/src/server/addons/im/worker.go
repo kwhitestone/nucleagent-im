@@ -407,7 +407,15 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 		}
 		row.FinalWuKongClientMsgNo = clientNo
 	}
-	payload, _ := json.Marshal(map[string]any{"type": wuKongTextType, "content": answer})
+	// Stamp A2A provenance on the durable message so the NEXT webhook hop reads a real
+	// chain id and depth instead of inferring one from history.
+	payload, _ := json.Marshal(textPayload{
+		Type: wuKongTextType, Content: answer,
+		A2A: &a2aProvenance{
+			ChainID: row.ChainID, Depth: row.ChainDepth,
+			OriginUID: row.OriginSenderUID, ViaUID: row.TargetAgentUID,
+		},
+	})
 	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
 		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
 		"channel_id": row.ChannelID, "channel_type": row.ChannelType, "client_msg_no": clientNo,

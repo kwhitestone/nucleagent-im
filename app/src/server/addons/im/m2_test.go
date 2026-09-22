@@ -84,6 +84,14 @@ func webhookText(id string, sender uint, channel string, channelType uint8, cont
 
 func strconvUint(value uint) string { return fmt.Sprintf("%d", value) }
 
+// acceptHuman exercises the M2 path: with no group-member resolver the agent-sender
+// C-rule parser can never fire, so these assertions stay exactly as M2 wrote them.
+func acceptHuman(
+	ctx context.Context, db *gorm.DB, event string, messages []webhookMessage, now time.Time,
+) (int, error) {
+	return acceptWebhookBatch(ctx, db, event, messages, now, nil)
+}
+
 func inboxCount(t *testing.T, db *gorm.DB) int64 {
 	t.Helper()
 	var count int64
@@ -102,17 +110,17 @@ func TestWebhookPrivateReplayOwnerAndAgentGuard(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 
 	message := webhookText("100", 1, "42@1", personChannel, "hello")
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
 		t.Fatalf("accepted=%d err=%v", accepted, err)
 	}
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 0 {
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 0 {
 		t.Fatalf("duplicate accepted=%d err=%v", accepted, err)
 	}
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify",
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify",
 		[]webhookMessage{webhookText("101", 2, "2@42", personChannel, "wrong owner")}, now); err != nil || accepted != 0 {
 		t.Fatalf("owner mismatch accepted=%d err=%v", accepted, err)
 	}
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify",
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify",
 		[]webhookMessage{webhookText("102", 42, "1@42", personChannel, "loop")}, now); err != nil || accepted != 0 {
 		t.Fatalf("agent sender accepted=%d err=%v", accepted, err)
 	}
@@ -148,11 +156,11 @@ func TestWebhookGroupMentionsAllowlistAndMultipleAgents(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 
 	owner := webhookText("200", 1, "g1", groupChannel, "both", 42, 43)
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{owner}, now); err != nil || accepted != 2 {
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{owner}, now); err != nil || accepted != 2 {
 		t.Fatalf("owner accepted=%d err=%v", accepted, err)
 	}
 	member := webhookText("201", 2, "g1", groupChannel, "one", 42, 43)
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{member}, now); err != nil || accepted != 1 {
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{member}, now); err != nil || accepted != 1 {
 		t.Fatalf("member accepted=%d err=%v", accepted, err)
 	}
 	allOnly := webhookText("202", 1, "g1", groupChannel, "@all")
@@ -160,7 +168,7 @@ func TestWebhookGroupMentionsAllowlistAndMultipleAgents(t *testing.T) {
 	_ = json.Unmarshal(allOnly.RawPayload, &payload)
 	payload["mention"] = map[string]any{"all": 1, "uids": []string{}}
 	allOnly.RawPayload, _ = json.Marshal(payload)
-	if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{allOnly}, now); err != nil || accepted != 0 {
+	if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{allOnly}, now); err != nil || accepted != 0 {
 		t.Fatalf("@all accepted=%d err=%v", accepted, err)
 	}
 	if count := inboxCount(t, db); count != 3 {
@@ -184,11 +192,11 @@ func TestWebhookRateLimitBoundaries(t *testing.T) {
 		now := time.Unix(1_800_000_000, 0)
 		for i := 1; i <= 5; i++ {
 			message := webhookText(fmt.Sprintf("s%d", i), 1, "1@42", personChannel, "hello")
-			if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
+			if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
 				t.Fatalf("request %d accepted=%d err=%v", i, accepted, err)
 			}
 		}
-		_, err := acceptWebhookBatch(t.Context(), db, "msg.notify",
+		_, err := acceptHuman(t.Context(), db, "msg.notify",
 			[]webhookMessage{webhookText("s6", 1, "1@42", personChannel, "hello")}, now)
 		if !errors.Is(err, errAgentRateLimited) {
 			t.Fatalf("sixth err=%v", err)
@@ -219,11 +227,11 @@ func TestWebhookRateLimitBoundaries(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			sender := uint(i/5 + 1)
 			message := webhookText(fmt.Sprintf("a%d", i), sender, "g", groupChannel, "hello", 42)
-			if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
+			if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
 				t.Fatalf("request %d accepted=%d err=%v", i+1, accepted, err)
 			}
 		}
-		_, err := acceptWebhookBatch(t.Context(), db, "msg.notify",
+		_, err := acceptHuman(t.Context(), db, "msg.notify",
 			[]webhookMessage{webhookText("a21", 5, "g", groupChannel, "hello", 42)}, now)
 		if !errors.Is(err, errAgentRateLimited) {
 			t.Fatalf("twenty-first err=%v", err)
@@ -247,11 +255,11 @@ func TestWebhookRateLimitDoesNotRollbackOtherMentionedAgent(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	for i := 0; i < 5; i++ {
 		message := webhookText(fmt.Sprintf("limited-%d", i), 1, "g", groupChannel, "hello", 42)
-		if accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
+		if accepted, err := acceptHuman(t.Context(), db, "msg.notify", []webhookMessage{message}, now); err != nil || accepted != 1 {
 			t.Fatalf("setup request %d accepted=%d err=%v", i+1, accepted, err)
 		}
 	}
-	accepted, err := acceptWebhookBatch(t.Context(), db, "msg.notify",
+	accepted, err := acceptHuman(t.Context(), db, "msg.notify",
 		[]webhookMessage{webhookText("mixed", 1, "g", groupChannel, "hello", 42, 43)}, now)
 	if !errors.Is(err, errAgentRateLimited) || accepted != 1 {
 		t.Fatalf("mixed accepted=%d err=%v", accepted, err)
