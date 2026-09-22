@@ -313,13 +313,49 @@ func TestA2AAgentHopUsesOriginHumanAuthorization(t *testing.T) {
 	}
 }
 
+func TestDispatchCarriesProvenanceToCore(t *testing.T) {
+	db := m2DB(t)
+	row := &IMWebhookInbox{
+		Event: "msg.notify", MessageIDStr: "carry", TargetAgentUID: 43, SenderUID: 42,
+		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,
+		ExecutionOwnerUserID: 1, SourceKey: "wukong:msg.notify:carry:43",
+		ChainID: "chain:carry", ChainDepth: 2, OriginSenderUID: 1, SourceAgentUID: 42,
+	}
+	if err := db.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	var got *a2aProvenance
+	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var input dispatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		got = input.Provenance
+		_ = json.NewEncoder(w).Encode(dispatchResult{
+			ConversationID: 9, SourceKey: input.SourceKey, Status: "accepted",
+		})
+	}))
+	defer core.Close()
+
+	p := &Plugin{coreURL: core.URL, serviceJWT: "test-token"}
+	if _, err := p.dispatchCore(t.Context(), row, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ChainID != "chain:carry" || got.Depth != 2 ||
+		got.OriginUID != 1 || got.ViaUID != 42 {
+		t.Fatalf("dispatched provenance=%+v", got)
+	}
+}
+
 func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 	db := m2DB(t)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "stamp", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,
 		ExecutionOwnerUserID: 1, SourceKey: "wukong:msg.notify:stamp:42",
-		ChainID: "chain:stamp", ChainDepth: 1, OriginSenderUID: 1,
+		ChainID: "chain:stamp", ChainDepth: 2, OriginSenderUID: 1, SourceAgentUID: 43,
 	}
 	if err := db.Create(&row).Error; err != nil {
 		t.Fatal(err)
@@ -356,8 +392,10 @@ func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 	if payload.Type != wuKongTextType || payload.Content != "转给 @user-43" {
 		t.Fatalf("payload=%+v", payload)
 	}
-	if payload.A2A == nil || payload.A2A.ChainID != "chain:stamp" || payload.A2A.Depth != 1 ||
-		payload.A2A.OriginUID != 1 || payload.A2A.ViaUID != 42 {
+	// ViaUID is the agent that TRIGGERED this answer (43), not its author (42): that is
+	// what the client renders as "via @agentA".
+	if payload.A2A == nil || payload.A2A.ChainID != "chain:stamp" || payload.A2A.Depth != 2 ||
+		payload.A2A.OriginUID != 1 || payload.A2A.ViaUID != 43 {
 		t.Fatalf("provenance=%+v", payload.A2A)
 	}
 	// Agent messages carry no mention metadata; the amendment exists precisely because
