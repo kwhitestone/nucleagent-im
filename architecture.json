@@ -4,6 +4,7 @@
   "enforceAddonImports": true,
   "coreFiles": [
     "app/src/server/main.go",
+    "app/src/server/logship_wire.go",
     "app/src/server/addons/addons.go",
     "app/src/server/addons/im/plugin.go",
     "app/src/server/addons/im/token.go",
