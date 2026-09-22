@@ -45,6 +45,7 @@ type dispatchRequest struct {
 	Channel              dispatchChannel `json:"channel"`
 	Input                string          `json:"input"`
 	InitialHistory       []historyTurn   `json:"initialHistory"`
+	Provenance           *a2aProvenance  `json:"provenance,omitempty"`
 }
 
 type dispatchChannel struct {
@@ -231,6 +232,10 @@ func (p *Plugin) dispatchCore(ctx context.Context, row *IMWebhookInbox, history 
 		SourceKey: row.SourceKey, ExecutionOwnerUserID: row.ExecutionOwnerUserID,
 		AgentUID: row.TargetAgentUID, Channel: dispatchChannel{ID: row.ChannelID, Type: int(row.ChannelType)},
 		Input: row.Text, InitialHistory: history,
+		Provenance: &a2aProvenance{
+			ChainID: row.ChainID, Depth: row.ChainDepth,
+			OriginUID: row.OriginSenderUID, ViaUID: row.SourceAgentUID,
+		},
 	}
 	var result dispatchResult
 	if err := doJSON(ctx, http.MethodPost, p.coreURL+"/api/v1/addons/conversation/im-dispatch", token, input, &result); err != nil {
@@ -407,7 +412,17 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 		}
 		row.FinalWuKongClientMsgNo = clientNo
 	}
-	payload, _ := json.Marshal(map[string]any{"type": wuKongTextType, "content": answer})
+	// Stamp A2A provenance on the durable message so the NEXT webhook hop reads a real
+	// chain id and depth instead of inferring one from history. ViaUID names the agent
+	// that triggered this answer (zero when a human did), which is what the client
+	// renders as "via @agentA".
+	payload, _ := json.Marshal(textPayload{
+		Type: wuKongTextType, Content: answer,
+		A2A: &a2aProvenance{
+			ChainID: row.ChainID, Depth: row.ChainDepth,
+			OriginUID: row.OriginSenderUID, ViaUID: row.SourceAgentUID,
+		},
+	})
 	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
 		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
 		"channel_id": row.ChannelID, "channel_type": row.ChannelType, "client_msg_no": clientNo,

@@ -39,8 +39,16 @@ type IMWebhookInbox struct {
 	FinalCoreMessageID     uint
 	FinalWuKongClientMsgNo string `gorm:"size:128"`
 	FinalSentAt            *time.Time
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// M3 A2A provenance (additive). ChainID identifies the origin chain that this
+	// row belongs to, ChainDepth is 1 for a human-originated trigger and +1 per
+	// agent hop, and OriginSenderUID is the human who started the chain — agent
+	// hops are authorized as that human, never as themselves.
+	ChainID         string `gorm:"size:191;not null;default:'';index"`
+	ChainDepth      int    `gorm:"not null;default:1"`
+	OriginSenderUID uint   `gorm:"not null;default:0"`
+	SourceAgentUID  uint   `gorm:"not null;default:0"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 func (IMWebhookInbox) TableName() string { return "im_webhook_inbox" }
