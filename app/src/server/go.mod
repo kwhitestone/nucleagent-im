@@ -31,6 +31,7 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/kwhitestone/nucleagent-storage-ndcs v0.0.0
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/lestrrat-go/file-rotatelogs v2.4.0+incompatible // indirect
 	github.com/lestrrat-go/strftime v1.0.6 // indirect
@@ -80,3 +81,7 @@ replace (
 	github.com/kwhitestone/prism-fusion => ../../../../prism-fusion/src/server
 	github.com/nucleagent/nucleagent-shared => ../../../../nucleagent-shared
 )
+
+replace github.com/kwhitestone/nucleagent-storage-ndcs => ../../../../nucleagent-storage-ndcs
+
+replace github.com/kwhitestone/nucleagent-storage => ../../../../nucleagent-storage/app/src/server
