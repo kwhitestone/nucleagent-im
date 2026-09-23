@@ -3,7 +3,8 @@
 # nucleagent-im image.
 #
 # Build context must be the workspace root because go.mod replace directives
-# point to prism-fusion and nucleagent-shared:
+# point to prism-fusion, nucleagent-shared, nucleagent-storage-ndcs and
+# nucleagent-storage/app/src/server:
 #
 #   docker build -t nucleagent-im -f nucleagent-im/Dockerfile .
 # =============================================================================
@@ -12,9 +13,15 @@ FROM golang:1.26 AS go-build
 ENV CGO_ENABLED=0 GO111MODULE=on GOPROXY=https://goproxy.cn,direct
 WORKDIR /build
 
-COPY nucleagent-im/app/src/server/ ./nucleagent-im/app/src/server/
-COPY prism-fusion/src/server/      ./prism-fusion/src/server/
-COPY nucleagent-shared/            ./nucleagent-shared/
+# ndcs is a build requirement, not an im-specific one: prism-fusion's own
+# initialize/gorm.go, utils/rotatelogs.go and the auth addon import it, and the
+# shared auth plugin is now in im's build graph. ndcs in turn imports
+# nucleagent-storage/contracts/provider, so storage has to be staged too.
+COPY nucleagent-im/app/src/server/      ./nucleagent-im/app/src/server/
+COPY prism-fusion/src/server/           ./prism-fusion/src/server/
+COPY nucleagent-shared/                 ./nucleagent-shared/
+COPY nucleagent-storage-ndcs/           ./nucleagent-storage-ndcs/
+COPY nucleagent-storage/app/src/server/ ./nucleagent-storage/app/src/server/
 
 WORKDIR /build/nucleagent-im/app/src/server
 RUN go build -ldflags="-s -w" -o /out/nucleagent-im .

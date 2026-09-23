@@ -10,6 +10,13 @@
 !prism-fusion/src/server/**
 !nucleagent-shared/
 !nucleagent-shared/**
+!nucleagent-storage-ndcs/
+!nucleagent-storage-ndcs/**
+!nucleagent-storage/
+!nucleagent-storage/app/
+!nucleagent-storage/app/src/
+!nucleagent-storage/app/src/server/
+!nucleagent-storage/app/src/server/**
 nucleagent-im/app/src/server/.env
 nucleagent-im/app/src/server/data
 nucleagent-im/app/src/server/log
@@ -17,3 +24,13 @@ prism-fusion/src/server/.env
 prism-fusion/src/server/data
 prism-fusion/src/server/log
 prism-fusion/src/server/go.work
+nucleagent-storage-ndcs/go.work
+nucleagent-storage-ndcs/go.work.sum
+nucleagent-storage/app/src/server/.env
+nucleagent-storage/app/src/server/data
+nucleagent-storage/app/src/server/log
+nucleagent-storage/app/src/server/go.work
+nucleagent-storage/app/src/server/go.work.sum
+# Keep private worktree state out even when building from a full workspace.
+**/.git
+**/.git/**
