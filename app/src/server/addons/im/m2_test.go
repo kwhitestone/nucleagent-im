@@ -278,7 +278,7 @@ func TestWebhookHTTPAuthMalformedEventAndSize(t *testing.T) {
 	_ = db
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(JWTMiddleware())
+	sharedAuthStack(t, router)
 	api := humagin.New(router, huma.DefaultConfig("im webhook test", "1"))
 	p := &Plugin{webhookCapability: strings.Repeat("c", 32)}
 	p.registerWebhook(api)

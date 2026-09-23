@@ -17,6 +17,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gin-gonic/gin"
+	authmiddleware "github.com/kwhitestone/prism-fusion/addons/auth/middleware"
 	authservice "github.com/kwhitestone/prism-fusion/addons/auth/service"
 	"github.com/kwhitestone/prism-fusion/global"
 	"github.com/kwhitestone/prism-fusion/plugin"
@@ -48,6 +49,26 @@ const (
 	userIDKey            contextKey = 1
 	webhookCapabilityKey contextKey = 2
 )
+
+// The two paths exempt from the shared JWT middleware. health is genuinely
+// public; the webhook authenticates itself with a capability token.
+const (
+	healthPath  = "/api/v1/im/health"
+	webhookPath = "/api/v1/im/webhooks/wukong"
+)
+
+// publicPaths is the single source of truth for the exemptions, so tests
+// asserting the auth surface cannot drift from what Initialize registers.
+var publicPaths = []string{healthPath, webhookPath}
+
+func isPublicPath(path string) bool {
+	for _, public := range publicPaths {
+		if path == public {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	capabilityLogPattern = regexp.MustCompile(`([?&]token=)[^&\s"]+`)
@@ -185,6 +206,11 @@ func (p *Plugin) Initialize(context.Context) error {
 			return errors.New("IM_SERVICE_JWT must identify service nucleagent-im")
 		}
 	}
+	// Exempt the two self-authenticating paths before Routers() runs; the
+	// lifecycle guarantees Initialize (Prepare) precedes route registration.
+	for _, path := range publicPaths {
+		authmiddleware.AddPublicPath(path)
+	}
 	p.wuKongAdminUser = configValue("IM_WUKONG_ADMIN_USER", "im.wukong-admin-user", "")
 	p.wuKongAdminPassword = configValue("IM_WUKONG_ADMIN_PASS", "im.wukong-admin-pass", "")
 	if (p.wuKongAdminUser == "") != (p.wuKongAdminPassword == "") {
@@ -193,8 +219,13 @@ func (p *Plugin) Initialize(context.Context) error {
 	return nil
 }
 
+// Middlewares runs after the shared auth plugin's global JWT middleware
+// (initialize/router.go registers every GlobalMiddlewares before any scoped
+// one), so bridgeUserID always observes the gin context the shared middleware
+// populated. webhookCapability is route-scoped because the webhook is a public
+// path that authenticates itself with a capability token instead of a JWT.
 func (p *Plugin) Middlewares() []gin.HandlerFunc {
-	return []gin.HandlerFunc{JWTMiddleware()}
+	return []gin.HandlerFunc{bridgeUserID(), webhookCapabilityMiddleware()}
 }
 
 func (p *Plugin) Models() []interface{} {
@@ -361,46 +392,61 @@ func postWuKongWithAuth(ctx context.Context, apiAddr, path, username, password s
 	return json.NewDecoder(response.Body).Decode(output)
 }
 
-func JWTMiddleware() gin.HandlerFunc {
-	jwtService := &authservice.JwtService{}
+// bridgeUserID adapts the shared middleware's gin-context user_id to the
+// request-context key im's huma handlers read (12 production call sites).
+//
+// It also re-asserts what the retired JWTMiddleware enforced and the shared
+// middleware does not: every inbound im route is user-scoped, so a service
+// principal (user_id 0) must not reach one. The shared middleware only fences
+// service tokens out of /auth and /rbac, which would leave im's handlers
+// operating as user 0 — minting connect tokens for uid "0" and reading another
+// principal's conversations. im's own service JWT is outbound only
+// (worker.go, stream.go call core), so nothing legitimate is refused here.
+//
+// ponytail: this adapter is expedient; its ceiling is "im handlers can never
+// see the gin context". If im ever migrates to native gin handlers, delete it
+// and change the 12 ctx.Value(userIDKey) reads instead.
+func bridgeUserID() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/api/v1/im/health" {
+		// The public paths never carry a user identity; they authenticate
+		// themselves (or are genuinely public) and must stay reachable.
+		if isPublicPath(c.Request.URL.Path) {
 			c.Next()
 			return
 		}
-		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/api/v1/im/webhooks/wukong" {
-			query := c.Request.URL.Query()
-			capability := query.Get("token")
-			query.Del("token")
-			c.Request.URL.RawQuery = query.Encode()
-			c.Request = c.Request.WithContext(context.WithValue(
-				c.Request.Context(), webhookCapabilityKey, capability,
-			))
-			c.Next()
+		uid, _ := c.Value("user_id").(uint)
+		if uid == 0 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"code": http.StatusUnauthorized, "message": "认证令牌无效或已过期",
+			})
 			return
 		}
-		raw, ok := strings.CutPrefix(c.GetHeader("Authorization"), "Bearer ")
-		if !ok || strings.TrimSpace(raw) == "" {
-			abortUnauthorized(c, "authentication token required")
-			return
-		}
-		claims, err := jwtService.ParseAccessToken(raw)
-		if err != nil || claims.UserID == 0 || claims.IsServicePrincipal() || claims.SessionID == "" {
-			abortUnauthorized(c, "invalid or expired authentication token")
-			return
-		}
-		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), userIDKey, claims.UserID))
+		c.Request = c.Request.WithContext(
+			context.WithValue(c.Request.Context(), userIDKey, uid))
 		c.Next()
 	}
 }
 
-func abortUnauthorized(c *gin.Context, message string) {
-	c.AbortWithStatusJSON(http.StatusUnauthorized, imProblem{
-		ErrorModel: huma.ErrorModel{
-			Status: http.StatusUnauthorized, Title: http.StatusText(http.StatusUnauthorized), Detail: message,
-		},
-		Code: "authentication_required",
-	})
+// webhookCapabilityMiddleware keeps the three behaviors the retired
+// JWTMiddleware gave the WuKong webhook: read ?token=, strip it from RawQuery
+// so it never reaches access logs or downstream URLs, and stash it for the
+// handler to compare in constant time. The route is an AddPublicPath, so the
+// shared JWT middleware never sees it.
+func webhookCapabilityMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost || c.Request.URL.Path != webhookPath {
+			c.Next()
+			return
+		}
+		query := c.Request.URL.Query()
+		capability := query.Get("token")
+		query.Del("token")
+		c.Request.URL.RawQuery = query.Encode()
+		c.Request = c.Request.WithContext(context.WithValue(
+			c.Request.Context(), webhookCapabilityKey, capability,
+		))
+		c.Next()
+	}
 }
 
 func configValue(envName, key, fallback string) string {

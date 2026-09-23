@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/kwhitestone/prism-fusion/config"
-	"github.com/kwhitestone/prism-fusion/global"
 )
 
 const testSecret = "0123456789abcdef0123456789abcdef"
@@ -115,13 +113,8 @@ func TestWuKongProxyUsesDomainError(t *testing.T) {
 }
 
 func TestBadJWTRejected(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	previous := global.PRISM_CONFIG
-	global.PRISM_CONFIG.JWT = config.JWT{SigningKey: testSecret}
-	t.Cleanup(func() { global.PRISM_CONFIG = previous })
-
 	router := gin.New()
-	router.Use(JWTMiddleware())
+	sharedAuthStack(t, router)
 	router.POST("/api/v1/im/connect-token", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})
@@ -133,9 +126,8 @@ func TestBadJWTRejected(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", response.Code)
 	}
-	for _, field := range []string{`"code":"authentication_required"`, `"detail":`} {
-		if !strings.Contains(response.Body.String(), field) {
-			t.Fatalf("response %q missing %s", response.Body.String(), field)
-		}
+	// The shared middleware owns the 401 envelope now; im no longer shapes it.
+	if !strings.Contains(response.Body.String(), `"code":401`) {
+		t.Fatalf("response %q missing shared 401 envelope", response.Body.String())
 	}
 }
