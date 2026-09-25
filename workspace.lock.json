@@ -4,7 +4,7 @@
     {
       "name": "prism-fusion",
       "repository": "kwhitestone/prism-fusion",
-      "commit": "894bd823028076d6b43e4edd08a3823e8820149f",
+      "commit": "a32f03b296121ef3fc7f9d257ab3a0935f2008b6",
       "role": "runtime",
       "goModules": [
         {
