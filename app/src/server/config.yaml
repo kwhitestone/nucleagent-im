@@ -11,6 +11,15 @@ cors:
       expose-headers: 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Content-Type, New-Token, New-Expires-At'
       allow-credentials: true
 
+# 认证配置：im 是资源服务，只保留共享 JWT 校验中间件，不提供登录端点。
+auth:
+  provider: 'builtin'
+  serve-routes: false
+
+# 权限控制：auth 是唯一 RBAC 控制面；im 只读消费共享库中的即时授权结果。
+rbac:
+  provider: 'external'
+
 jwt:
   signing-key: '${JWT_SECRET}'
   expires-time: '15m'

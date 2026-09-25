@@ -85,7 +85,7 @@ func TestWebhookHTTPBeta21Envelope(t *testing.T) {
 			}
 			gin.SetMode(gin.TestMode)
 			router := gin.New()
-			router.Use(JWTMiddleware())
+			sharedAuthStack(t, router)
 			api := humagin.New(router, huma.DefaultConfig("webhook contract test", "1"))
 			(&Plugin{webhookCapability: capability}).registerWebhook(api)
 			if api.OpenAPI().Components.Schemas.Map()["WebhookMessage"].AdditionalProperties != false {

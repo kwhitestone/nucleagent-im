@@ -16,9 +16,6 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humagin"
 	"github.com/gin-gonic/gin"
 	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
-	authservice "github.com/kwhitestone/prism-fusion/addons/auth/service"
-	"github.com/kwhitestone/prism-fusion/config"
-	"github.com/kwhitestone/prism-fusion/global"
 )
 
 type fakeWuKong struct {
@@ -111,7 +108,7 @@ func groupRouter(t *testing.T, plugin *Plugin, authenticated bool) *gin.Engine {
 			c.Next()
 		})
 	} else {
-		router.Use(JWTMiddleware())
+		sharedAuthStack(t, router)
 	}
 	api := humagin.New(router, huma.DefaultConfig("group test", "1"))
 	plugin.registerGroups(api)
@@ -399,25 +396,19 @@ func TestGroupDomainErrorsAndUnauthenticated(t *testing.T) {
 		})
 	}
 
-	previous := global.PRISM_CONFIG
-	global.PRISM_CONFIG.JWT = config.JWT{
-		SigningKey: testSecret, ExpiresTime: "15m", Issuer: "test",
-	}
-	t.Cleanup(func() { global.PRISM_CONFIG = previous })
-	unauthenticated := groupRouter(t, fake.plugin(), false)
-	response := groupRequest(t, unauthenticated, http.MethodGet, "/api/v1/im/groups", 0, nil)
-	if response.Code != http.StatusUnauthorized || responseCode(t, response) != "authentication_required" {
-		t.Fatalf("unauthenticated=%d %s", response.Code, response.Body.String())
-	}
-	token, err := (&authservice.JwtService{}).GenerateSessionToken(1, "user-1", 1, "session-1")
-	if err != nil {
+	// The same routes behind the real shared auth stack: anonymous is rejected
+	// by the framework middleware, and a live session reaches the handler with
+	// its user id bridged into the request context.
+	if err := db.AutoMigrate(&authmodel.RefreshSession{}); err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/im/groups", nil)
-	request.Header.Set("Authorization", "Bearer "+token)
-	recorder := httptest.NewRecorder()
-	unauthenticated.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
+	guarded := groupRouter(t, fake.plugin(), false)
+	response := groupRequest(t, guarded, http.MethodGet, "/api/v1/im/groups", 0, nil)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated=%d %s", response.Code, response.Body.String())
+	}
+	token := issueSessionToken(t, db, 1, "session-1")
+	if recorder := authorizedRequest(t, guarded, http.MethodGet, "/api/v1/im/groups", token); recorder.Code != http.StatusOK {
 		t.Fatalf("authenticated status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
