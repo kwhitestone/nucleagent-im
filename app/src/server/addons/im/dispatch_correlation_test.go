@@ -39,6 +39,9 @@ func TestDispatchTwoTurnsAndReconnect(t *testing.T) {
 			answers = append(answers, text.Content)
 			fmt.Fprint(w, `{}`)
 		case "/api/v1/addons/conversation/im-dispatch":
+			if got := r.Header.Get("Authorization"); got != "test-token" {
+				t.Errorf("dispatch Authorization=%q, want bare token", got)
+			}
 			var input dispatchRequest
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 				t.Error(err)
@@ -78,7 +81,8 @@ func TestDispatchTwoTurnsAndReconnect(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	p := &Plugin{apiAddr: server.URL, coreURL: server.URL, serviceJWT: "test-token"}
+	// Configured with a Bearer prefix: core must still receive the bare token (A-16).
+	p := &Plugin{apiAddr: server.URL, coreURL: server.URL, serviceJWT: "Bearer test-token"}
 	for turn := 1; turn <= 2; turn++ {
 		row := IMWebhookInbox{
 			Event: "msg.notify", MessageIDStr: fmt.Sprint(turn), TargetAgentUID: 42,

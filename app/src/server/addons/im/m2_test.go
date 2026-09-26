@@ -377,6 +377,9 @@ func TestCoreStreamResumeSnapshotsFinalAndIdempotency(t *testing.T) {
 		if got := r.Header.Get("Last-Event-ID"); got != "7" {
 			t.Fatalf("Last-Event-ID=%q", got)
 		}
+		if got := r.Header.Get("Authorization"); got != "test-token" {
+			t.Fatalf("Authorization=%q, want bare token", got)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "id: 8\nevent: message-updated\ndata: {\"id\":8,\"senderType\":\"agent\",\"msgType\":\"streaming\",\"content\":\"Hel\"}\n\n")
 		fmt.Fprint(w, "id: 8\nevent: message-updated\ndata: {\"id\":8,\"senderType\":\"agent\",\"msgType\":\"streaming\",\"content\":\"Hello\"}\n\n")
@@ -628,5 +631,13 @@ func TestFinalWuKongPayloadIsBase64Text(t *testing.T) {
 	defer server.Close()
 	if err := (&Plugin{apiAddr: server.URL}).sendFinal(context.Background(), &row, 7, "answer"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBareToken(t *testing.T) {
+	for in, want := range map[string]string{"t": "t", "Bearer t": "t", " Bearer t ": "t", "": ""} {
+		if got := bareToken(in); got != want {
+			t.Errorf("bareToken(%q)=%q, want %q", in, got, want)
+		}
 	}
 }

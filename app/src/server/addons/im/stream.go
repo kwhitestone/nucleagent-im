@@ -36,7 +36,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		return err
 	}
 	request.Header.Set("Accept", "text/event-stream")
-	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Authorization", token) // A-16: bare; PROD gateway rejects Bearer
 	if row.LastCoreEventID != "" {
 		request.Header.Set("Last-Event-ID", row.LastCoreEventID)
 	}

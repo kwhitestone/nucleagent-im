@@ -199,7 +199,7 @@ func (p *Plugin) Initialize(context.Context) error {
 		return errors.New("CORE_URL must be a valid http or https URL")
 	}
 	p.coreURL = strings.TrimRight(coreURL, "/")
-	p.serviceJWT = configValue("IM_SERVICE_JWT", "im.service-jwt", "")
+	p.serviceJWT = bareToken(configValue("IM_SERVICE_JWT", "im.service-jwt", ""))
 	if p.serviceJWT != "" {
 		claims, parseErr := (&authservice.JwtService{}).ParseAccessToken(p.serviceJWT)
 		if parseErr != nil || !claims.IsServicePrincipal() || claims.Username != "nucleagent-im" {

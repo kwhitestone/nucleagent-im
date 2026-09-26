@@ -218,7 +218,7 @@ func (p *Plugin) dispatchAndStream(ctx context.Context, row *IMWebhookInbox) err
 
 func (p *Plugin) serviceToken() (string, error) {
 	if p.serviceJWT != "" {
-		return p.serviceJWT, nil
+		return bareToken(p.serviceJWT), nil
 	}
 	return (&authservice.JwtService{}).GenerateToken(0, "nucleagent-im", 0)
 }
@@ -336,6 +336,11 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
 }
 
+// bareToken accepts a token with or without the `Bearer ` scheme and returns it bare.
+func bareToken(value string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "Bearer "))
+}
+
 func doJSON(ctx context.Context, method, url, bearer string, input, output any) error {
 	var body io.Reader
 	if input != nil {
@@ -353,7 +358,7 @@ func doJSON(ctx context.Context, method, url, bearer string, input, output any) 
 		request.Header.Set("Content-Type", "application/json")
 	}
 	if bearer != "" {
-		request.Header.Set("Authorization", "Bearer "+bearer)
+		request.Header.Set("Authorization", bearer) // A-16: bare; PROD gateway rejects Bearer
 	}
 	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
 	if err != nil {
