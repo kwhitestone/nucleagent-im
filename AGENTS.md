@@ -2,7 +2,8 @@
 
 Thin Go bridge between NucleAgent authentication and WuKongIM. The HTTP service listens on port 26655.
 
-Before editing, read `../nucleagent-docs/docs/nucleagent/09-workspace-frontend-maintenance.md` and the workspace `AGENTS.md`.
+<!-- Absolute path on purpose: a ../nucleagent-docs link resolves against the checkout dir, so from a worktree (wt/<name>) it points at a nonexistent wt/nucleagent-docs. -->
+Before editing, read `/home/workspace/nucleagent-workspace/nucleagent-docs/docs/nucleagent/09-workspace-frontend-maintenance.md` and the workspace `AGENTS.md`.
 
 ## Boundaries
 
