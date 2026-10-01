@@ -315,6 +315,8 @@ func TestA2AAgentHopUsesOriginHumanAuthorization(t *testing.T) {
 
 func TestDispatchCarriesProvenanceToCore(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
+	addUser(t, db, 43, authmodel.AccountTypeAgent)
 	row := &IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "carry", TargetAgentUID: 43, SenderUID: 42,
 		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,
@@ -351,6 +353,8 @@ func TestDispatchCarriesProvenanceToCore(t *testing.T) {
 
 func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "stamp", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,

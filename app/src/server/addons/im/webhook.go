@@ -299,7 +299,10 @@ func acceptWebhookMessage(
 	}
 
 	var bindings []model.AgentInstance
-	query := db.Where("auth_agent_user_id IN ? AND im_enabled = ?", targets, true)
+	enabledAgents := db.Model(&authmodel.User{}).Select("id").
+		Where("enable = ? AND account_type = ?", 1, authmodel.AccountTypeAgent)
+	query := db.Where("auth_agent_user_id IN ? AND im_enabled = ?", targets, true).
+		Where("auth_agent_user_id IN (?)", enabledAgents)
 	if message.ChannelType == personChannel {
 		// A direct channel only triggers the peer agent the sender itself owns.
 		query = query.Where("user_id = ?", uint(senderUID))

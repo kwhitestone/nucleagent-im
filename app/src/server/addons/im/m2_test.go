@@ -355,6 +355,8 @@ func TestLeaseRecoveryAndRetryExhaustion(t *testing.T) {
 
 func TestCoreStreamResumeSnapshotsFinalAndIdempotency(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "stream", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
@@ -408,6 +410,8 @@ func TestCoreStreamResumeSnapshotsFinalAndIdempotency(t *testing.T) {
 
 func TestCoreStreamRetriesFinalEventAfterWuKongFailure(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "retry-final", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
@@ -607,6 +611,8 @@ func TestScanSSECumulativeReplacement(t *testing.T) {
 
 func TestFinalWuKongPayloadIsBase64Text(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "payload", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,

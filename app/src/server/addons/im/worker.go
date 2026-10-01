@@ -224,6 +224,9 @@ func (p *Plugin) serviceToken() (string, error) {
 }
 
 func (p *Plugin) dispatchCore(ctx context.Context, row *IMWebhookInbox, history []historyTurn) (*dispatchResult, error) {
+	if err := checkDispatchParticipants(ctx, row); err != nil {
+		return nil, err
+	}
 	token, err := p.serviceToken()
 	if err != nil {
 		return nil, err
@@ -397,6 +400,9 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 	}
 	if current.State == inboxCompleted && current.FinalSentAt != nil {
 		return nil
+	}
+	if err := checkDispatchParticipants(ctx, row); err != nil {
+		return err
 	}
 	if row.FinalWuKongClientMsgNo == "" {
 		row.FinalWuKongClientMsgNo = current.FinalWuKongClientMsgNo
