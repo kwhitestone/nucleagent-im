@@ -25,6 +25,7 @@ type fakeWuKong struct {
 	members  map[string][]uint
 	failPath string
 	deletes  int
+	removes  int
 }
 
 func newFakeWuKong(t *testing.T) *fakeWuKong {
@@ -54,10 +55,26 @@ func (f *fakeWuKong) serveHTTP(response http.ResponseWriter, request *http.Reque
 		var body struct {
 			ChannelID   string   `json:"channel_id"`
 			Subscribers []string `json:"subscribers"`
+			UIDs        []string `json:"uids"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			f.t.Errorf("decode WuKong request: %v", err)
 			response.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if strings.HasPrefix(request.URL.Path, "/manager/channels/2/") &&
+			strings.HasSuffix(request.URL.Path, "/subscribers/remove") {
+			f.removes++
+			if request.URL.Path == f.failPath {
+				response.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			channelID := strings.Split(request.URL.Path, "/")[4]
+			for _, raw := range body.UIDs {
+				uid, _ := strconv.ParseUint(raw, 10, 64)
+				f.members[channelID] = removeUID(f.members[channelID], uint(uid))
+			}
+			response.WriteHeader(http.StatusOK)
 			return
 		}
 		subscribers := make([]uint, 0, len(body.Subscribers))
@@ -78,7 +95,7 @@ func (f *fakeWuKong) serveHTTP(response http.ResponseWriter, request *http.Reque
 			}
 		case "/channel/delete":
 			f.deletes++
-			delete(f.members, body.ChannelID)
+			// WuKong marks the channel disbanded but retains its subscribers.
 		default:
 			response.WriteHeader(http.StatusNotFound)
 			return
@@ -229,6 +246,11 @@ func TestGroupLifecycleAndCreatorPolicy(t *testing.T) {
 	if err := db.Model(&IMGroup{}).Count(&count).Error; err != nil || count != 0 {
 		t.Fatalf("groups after delete=%d err=%v", count, err)
 	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if members := fake.members[group.WuKongChannelID]; len(members) != 0 || fake.removes != 1 {
+		t.Fatalf("subscribers after delete=%v removal calls=%d", members, fake.removes)
+	}
 }
 
 func TestGroupWuKongFailureCompensation(t *testing.T) {
@@ -250,7 +272,12 @@ func TestGroupWuKongFailureCompensation(t *testing.T) {
 		}
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
-		if len(fake.members) != 0 || fake.deletes != 1 {
+		for channel, members := range fake.members {
+			if len(members) != 0 {
+				t.Fatalf("orphan subscribers for %s: %v", channel, members)
+			}
+		}
+		if fake.deletes != 1 || fake.removes != 1 {
 			t.Fatalf("WuKong state=%v deletes=%d", fake.members, fake.deletes)
 		}
 	})
@@ -328,6 +355,30 @@ func TestGroupWuKongFailureCompensation(t *testing.T) {
 			t.Fatalf("remove rollback members=%v", fake.members[group.WuKongChannelID])
 		}
 	})
+}
+
+func TestGroupDeleteSubscriberCleanupFailure(t *testing.T) {
+	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 2, authmodel.AccountTypeHuman)
+	fake := newFakeWuKong(t)
+	router := groupRouter(t, fake.plugin(), true)
+	group := createGroupForTest(t, router, "Cleanup failure", 2)
+	fake.failPath = "/manager/channels/2/" + group.WuKongChannelID + "/subscribers/remove"
+	response := groupRequest(t, router, http.MethodDelete,
+		fmt.Sprintf("/api/v1/im/groups/%d", group.ID), 1, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete response=%d %s", response.Code, response.Body.String())
+	}
+	var count int64
+	if err := db.Model(&IMGroup{}).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("groups after delete=%d err=%v", count, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.deletes != 1 || fake.removes != 1 || len(fake.members[group.WuKongChannelID]) != 2 {
+		t.Fatalf("deletes=%d removes=%d members=%v", fake.deletes, fake.removes, fake.members)
+	}
 }
 
 func TestAllowlistReplaceAndOwnerImplicit(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -161,5 +162,42 @@ func TestManagerRefreshesExpiredCache(t *testing.T) {
 	}
 	if token, err := p.managerAccessToken(context.Background(), ""); err != nil || token != "fresh" || logins != 1 {
 		t.Fatalf("expiry refresh failed: logins=%d err=%v", logins, err)
+	}
+}
+
+func TestManagerPostReplaysBodyAfterUnauthorized(t *testing.T) {
+	logins, posts := 0, 0
+	const body = `{"uids":["5","11","33"]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/manager/login" {
+			logins++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": fmt.Sprintf("token-%d", logins), "expires_at": time.Now().Add(time.Hour),
+			})
+			return
+		}
+		posts++
+		got, err := io.ReadAll(r.Body)
+		if err != nil || string(got) != body || r.Method != http.MethodPost ||
+			r.Header.Get("Content-Type") != "application/json" ||
+			r.Header.Get("Authorization") != fmt.Sprintf("Bearer token-%d", logins) {
+			t.Error("invalid authenticated Manager POST")
+		}
+		if posts == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	p := &Plugin{managerAddr: server.URL, wuKongAdminUser: "admin", wuKongAdminPassword: "test-password"}
+	response, err := p.managerRequest(context.Background(), http.MethodPost,
+		server.URL+"/manager/channels/2/group/subscribers/remove", []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || logins != 2 || posts != 2 {
+		t.Fatalf("status=%d logins=%d posts=%d", response.StatusCode, logins, posts)
 	}
 }

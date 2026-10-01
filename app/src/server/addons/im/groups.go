@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -204,6 +205,7 @@ func (p *Plugin) createGroup(ctx context.Context, input *groupInput) (*groupOutp
 			p.wuKongAdminUser, p.wuKongAdminPassword,
 			map[string]any{"channel_id": channelID, "channel_type": groupChannel}, nil)
 		_ = global.PRISM_DB.Delete(&group).Error
+		p.cleanupWuKongGroupSubscribers(context.WithoutCancel(ctx), channelID, members)
 		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
 	}
 	return groupResponse(group), nil
@@ -351,7 +353,29 @@ func (p *Plugin) deleteGroup(ctx context.Context, input *groupIDInput) (*emptyOu
 		p.restoreWuKongGroup(context.WithoutCancel(ctx), group.GroupID, members)
 		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group metadata could not be deleted")
 	}
+	p.cleanupWuKongGroupSubscribers(context.WithoutCancel(ctx), group.GroupID, members)
 	return &emptyOutput{Body: envelope[any]{Code: 0, Message: "success", Data: nil}}, nil
+}
+
+func (p *Plugin) cleanupWuKongGroupSubscribers(ctx context.Context, channelID string, members []uint) {
+	if len(members) == 0 {
+		return
+	}
+	// WuKong deletion only disbands; Manager removal also clears membership indexes.
+	// ponytail: best-effort cleanup; add durable retries if operational residue warrants it.
+	body, _ := json.Marshal(map[string][]string{"uids": uidStrings(members)})
+	response, err := p.managerRequest(ctx, http.MethodPost,
+		p.managerAddr+"/manager/channels/2/"+url.PathEscape(channelID)+"/subscribers/remove", body)
+	if err != nil {
+		// Upstream errors can contain credentials or response bodies.
+		slog.Warn("wukong group subscriber cleanup failed", "channel_id", channelID)
+		return
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		slog.Warn("wukong group subscriber cleanup failed", "channel_id", channelID, "status", response.StatusCode)
+	}
 }
 
 func (p *Plugin) listGroupMembers(ctx context.Context, input *groupIDInput) (*groupMembersOutput, error) {

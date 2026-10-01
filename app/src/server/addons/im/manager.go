@@ -1,6 +1,7 @@
 package im
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -37,17 +38,24 @@ func (p *Plugin) managerAccessToken(ctx context.Context, rejected string) (strin
 }
 
 func (p *Plugin) managerGet(ctx context.Context, endpoint string) (*http.Response, error) {
+	return p.managerRequest(ctx, http.MethodGet, endpoint, nil)
+}
+
+func (p *Plugin) managerRequest(ctx context.Context, method, endpoint string, body []byte) (*http.Response, error) {
 	token, err := p.managerAccessToken(ctx, "")
 	if err != nil {
 		return nil, err
 	}
 	for attempt := 0; ; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		if token != "" {
 			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		if body != nil {
+			request.Header.Set("Content-Type", "application/json")
 		}
 		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
 		if err != nil {
