@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -298,27 +299,16 @@ func acceptWebhookMessage(
 		return 0, nil
 	}
 
-	var bindings []model.AgentInstance
-	enabledAgents := db.Model(&authmodel.User{}).Select("id").
-		Where("enable = ? AND account_type = ?", 1, authmodel.AccountTypeAgent)
-	query := db.Where("auth_agent_user_id IN ? AND im_enabled = ?", targets, true).
-		Where("auth_agent_user_id IN (?)", enabledAgents)
-	if message.ChannelType == personChannel {
-		// A direct channel only triggers the peer agent the sender itself owns.
-		query = query.Where("user_id = ?", uint(senderUID))
-	}
-	if err := query.Find(&bindings).Error; err != nil {
+	resolved, err := resolveAgentTargets(db, targets, message.ChannelType, uint(senderUID), origin.originUID)
+	if err != nil {
 		return 0, err
 	}
 
 	mentions, _ := json.Marshal(payload.Mention.UIDs)
 	accepted := 0
 	var deferred error
-	for i := range bindings {
-		if bindings[i].AuthAgentUserID == nil {
-			continue
-		}
-		agentUID := *bindings[i].AuthAgentUserID
+	for _, target := range resolved {
+		agentUID, ownerUID := target.agentUID, target.ownerUID
 		if agentUID == uint(senderUID) {
 			// An agent never re-triggers itself, whatever the text says.
 			continue
@@ -329,7 +319,7 @@ func acceptWebhookMessage(
 			ClientMessageNo: message.ClientMsgNo, SenderUID: uint(senderUID), ChannelID: channelID,
 			ChannelType: message.ChannelType, MessageTimestamp: message.Timestamp,
 			Text: strings.TrimSpace(payload.Content), MentionUIDs: string(mentions), State: inboxPending,
-			ExecutionOwnerUserID: bindings[i].UserID, SourceKey: sourceKey,
+			ExecutionOwnerUserID: ownerUID, SourceKey: sourceKey,
 			ChainID: origin.chainID, ChainDepth: origin.depth,
 			OriginSenderUID: origin.originUID, SourceAgentUID: origin.sourceAgent,
 		}
@@ -358,7 +348,10 @@ func acceptWebhookMessage(
 				rateKey(uint(senderUID), agentUID, message.ChannelType, channelID), senderMinuteLimit, now); err != nil {
 				return err
 			}
-			if err := takeRateLimit(tx, "agent", rateKey(agentUID), agentMinuteCeiling, now); err != nil {
+			// Keyed per (agent, owner): a definition identity is shared by every user, so a
+			// per-agent key would give the whole company one 20/min budget. An instance
+			// binding has a single owner, so the pair is equivalent to the agent there.
+			if err := takeRateLimit(tx, "agent", rateKey(agentUID, ownerUID), agentMinuteCeiling, now); err != nil {
 				return err
 			}
 			inserted = true
@@ -378,6 +371,49 @@ func acceptWebhookMessage(
 		}
 	}
 	return accepted, deferred
+}
+
+type agentTarget struct{ agentUID, ownerUID uint }
+
+// resolveAgentTargets maps addressed agent UIDs to (agent, execution owner) pairs.
+// A legacy instance-level binding (M2) wins and keeps its owner. A UID with no
+// instance binding may be a definition-level identity shared by everyone: it runs
+// in the instance of whoever started the chain (the sender, or the human origin of
+// an A2A hop), mirroring Core's resolveIMBinding.
+func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, senderUID, originUID uint) ([]agentTarget, error) {
+	var enabled []uint
+	if err := db.Model(&authmodel.User{}).
+		Where("id IN ? AND enable = ? AND account_type = ?", targets, 1, authmodel.AccountTypeAgent).
+		Pluck("id", &enabled).Error; err != nil || len(enabled) == 0 {
+		return nil, err
+	}
+	var bindings []model.AgentInstance
+	if err := db.Where("auth_agent_user_id IN ?", enabled).Find(&bindings).Error; err != nil {
+		return nil, err
+	}
+	out := make([]agentTarget, 0, len(enabled))
+	rest := slices.Clone(enabled)
+	for i := range bindings {
+		agentUID := *bindings[i].AuthAgentUserID
+		// Instance-bound, so never a definition identity, enabled for IM or not.
+		rest = slices.DeleteFunc(rest, func(uid uint) bool { return uid == agentUID })
+		// A direct channel only triggers the peer agent the sender itself owns.
+		if !bindings[i].IMEnabled || (channelType == personChannel && bindings[i].UserID != senderUID) {
+			continue
+		}
+		out = append(out, agentTarget{agentUID, bindings[i].UserID})
+	}
+	if len(rest) == 0 {
+		return out, nil
+	}
+	var definitions []model.AgentTemplate
+	if err := db.Where("auth_agent_user_id IN ? AND is_active = ?", rest, true).Find(&definitions).Error; err != nil {
+		return nil, err
+	}
+	for i := range definitions {
+		out = append(out, agentTarget{*definitions[i].AuthAgentUserID, originUID})
+	}
+	return out, nil
 }
 
 // chainIDFor derives a stable chain identifier from the message that started a chain.

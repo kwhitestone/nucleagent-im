@@ -31,7 +31,7 @@ func m2DB(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	if err := db.AutoMigrate(
-		&authmodel.User{}, &model.AgentInstance{},
+		&authmodel.User{}, &model.AgentInstance{}, &model.AgentTemplate{},
 		&IMWebhookInbox{}, &IMCoreConversationMap{}, &IMGroup{},
 		&IMGroupAgentAllowlist{}, &IMRateWindow{},
 	); err != nil {
