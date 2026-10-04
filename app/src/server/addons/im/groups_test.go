@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -24,6 +25,7 @@ type fakeWuKong struct {
 	mu       sync.Mutex
 	members  map[string][]uint
 	failPath string
+	getFail  map[string]int // channel -> Manager GET status (404 = channel wiped)
 	deletes  int
 	removes  int
 }
@@ -43,6 +45,10 @@ func (f *fakeWuKong) serveHTTP(response http.ResponseWriter, request *http.Reque
 	case request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/manager/channels/2/"):
 		parts := strings.Split(request.URL.Path, "/")
 		channelID := parts[len(parts)-2]
+		if status := f.getFail[channelID]; status != 0 {
+			response.WriteHeader(status)
+			return
+		}
 		items := make([]map[string]string, len(f.members[channelID]))
 		for i, uid := range f.members[channelID] {
 			items[i] = map[string]string{"uid": strconv.FormatUint(uint64(uid), 10)}
@@ -250,6 +256,59 @@ func TestGroupLifecycleAndCreatorPolicy(t *testing.T) {
 	defer fake.mu.Unlock()
 	if members := fake.members[group.WuKongChannelID]; len(members) != 0 || fake.removes != 1 {
 		t.Fatalf("subscribers after delete=%v removal calls=%d", members, fake.removes)
+	}
+}
+
+func TestGroupListSkipsGroupsMissingInWuKong(t *testing.T) {
+	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 2, authmodel.AccountTypeHuman)
+	fake := newFakeWuKong(t)
+	router := groupRouter(t, fake.plugin(), true)
+	alive := createGroupForTest(t, router, "Alive", 2)
+	dead := createGroupForTest(t, router, "Dead", 2)
+	other := createGroupForTest(t, router, "Other", 2)
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	list := func() (int, string) {
+		response := groupRequest(t, router, http.MethodGet, "/api/v1/im/groups", 2, nil)
+		return response.Code, response.Body.String()
+	}
+
+	if code, body := list(); code != http.StatusOK || !strings.Contains(body, `"title":"Dead"`) {
+		t.Fatalf("all healthy=%d %s", code, body)
+	}
+	fake.mu.Lock()
+	fake.getFail = map[string]int{dead.WuKongChannelID: http.StatusNotFound}
+	fake.mu.Unlock()
+	code, body := list()
+	if code != http.StatusOK || strings.Contains(body, `"title":"Dead"`) ||
+		!strings.Contains(body, `"title":"Alive"`) || !strings.Contains(body, `"title":"Other"`) {
+		t.Fatalf("one dead group=%d %s", code, body)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), dead.WuKongChannelID) ||
+		!strings.Contains(logs.String(), "status=404") {
+		t.Fatalf("dead group not logged: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), alive.WuKongChannelID) || strings.Contains(logs.String(), other.WuKongChannelID) {
+		t.Fatalf("healthy groups logged: %s", logs.String())
+	}
+
+	// Every group dead but Manager answering 404: wiped WuKong, an empty list is the truth.
+	fake.mu.Lock()
+	fake.getFail = map[string]int{alive.WuKongChannelID: 404, dead.WuKongChannelID: 404, other.WuKongChannelID: 404}
+	fake.mu.Unlock()
+	if code, body := list(); code != http.StatusOK || !strings.Contains(body, `"data":[]`) {
+		t.Fatalf("all wiped=%d %s", code, body)
+	}
+	// Manager down for every group: still a 503, not a silently empty list.
+	fake.mu.Lock()
+	fake.getFail = map[string]int{alive.WuKongChannelID: 502, dead.WuKongChannelID: 502, other.WuKongChannelID: 502}
+	fake.mu.Unlock()
+	if code, body := list(); code != http.StatusServiceUnavailable || !strings.Contains(body, "wukong_unavailable") {
+		t.Fatalf("manager down=%d %s", code, body)
 	}
 }
 

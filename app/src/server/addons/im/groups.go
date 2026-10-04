@@ -219,14 +219,30 @@ func (p *Plugin) listGroups(ctx context.Context, _ *struct{}) (*groupsOutput, er
 	caller := ctx.Value(userIDKey).(uint)
 	out := make([]groupData, 0, len(groups))
 	// ponytail: one Manager lookup per local group; add a membership index only when group counts require it.
+	// A failed lookup skips that group: a WuKong wipe leaves im rows with no channel, and one dead
+	// row must not fail every user's list. Only a Manager that answered nothing at all is a 503.
+	answered, outage := false, false
 	for i := range groups {
 		members, err := p.wuKongGroupMembers(ctx, groups[i].GroupID)
 		if err != nil {
-			return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+			status := 0
+			var upstream *httpStatusError
+			if errors.As(err, &upstream) {
+				status = upstream.status
+			}
+			outage = outage || status != http.StatusNotFound
+			// Upstream errors can contain credentials or response bodies; log the status only.
+			slog.Warn("im group skipped: wukong membership lookup failed",
+				"group_id", groups[i].ID, "channel_id", groups[i].GroupID, "status", status)
+			continue
 		}
+		answered = true
 		if containsUID(members, caller) {
 			out = append(out, groupDTO(groups[i]))
 		}
+	}
+	if outage && !answered {
+		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
 	}
 	return &groupsOutput{Body: envelope[[]groupData]{Code: 0, Message: "success", Data: out}}, nil
 }
