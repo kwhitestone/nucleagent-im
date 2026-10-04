@@ -268,6 +268,7 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 	p.registerAgentStreams(api)
 	p.registerGroups(api)
 	p.registerRecipients(api)
+	p.registerAgents(api)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "imHealth",
