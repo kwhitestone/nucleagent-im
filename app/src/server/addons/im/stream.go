@@ -217,6 +217,10 @@ func (p *Plugin) wuKongGroupMember(ctx context.Context, channelID string, userID
 	return err == nil, err
 }
 
+// agentStreamReplayWindow still delivers a reply or failure that lands just
+// before the chat opens or across a stream reconnect.
+const agentStreamReplayWindow = 2 * time.Minute
+
 func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelType uint8) {
 	hctx.SetHeader("Content-Type", "text/event-stream")
 	hctx.SetHeader("Cache-Control", "no-cache")
@@ -226,6 +230,12 @@ func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelTy
 	flusher, _ := writer.(http.Flusher)
 	ctx := hctx.Context()
 	seen := map[uint]string{}
+	// Rows that finished before this window are history, not live news: a
+	// completed one is already the durable message, a dead one an old failure.
+	// Replaying them doubled past replies (the replay reaches further back than
+	// the 30 loaded messages) and resurfaced old "could not complete" lines on
+	// every open (UNI-P-BATCH1 P3 / IM-REDESIGN O1).
+	finishedSince := time.Now().Add(-agentStreamReplayWindow)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -233,7 +243,8 @@ func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelTy
 	send := func() bool {
 		var rows []IMWebhookInbox
 		if err := global.PRISM_DB.Where("channel_id = ? AND channel_type = ?", channelID, channelType).
-			Where("state IN ?", []string{inboxProcessing, inboxCompleted, inboxDead}).
+			Where("state = ? OR (state IN ? AND updated_at >= ?)",
+				inboxProcessing, []string{inboxCompleted, inboxDead}, finishedSince).
 			Order("id DESC").Limit(100).Find(&rows).Error; err != nil {
 			return false
 		}
