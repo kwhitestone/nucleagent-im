@@ -162,6 +162,7 @@ func (p *Plugin) registerWebhook(api huma.API) {
 		// Persistence first: the admission cap below gates agent triggers only, never the save.
 		if err := persistWebhookMessages(ctx, global.PRISM_DB, input.Body); err != nil {
 			slog.Error("im message persist failed", "error", err)
+			p.backfillDue.Store(true) // WuKong may drop this batch after its 3 retries
 			return nil, newWebhookProblem(http.StatusServiceUnavailable, "im_inbox_unavailable", "webhook could not be recorded")
 		}
 		if !p.webhookAdmission.allow(time.Now()) {

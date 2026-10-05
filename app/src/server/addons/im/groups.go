@@ -739,15 +739,26 @@ func (p *Plugin) restoreWuKongGroup(ctx context.Context, channelID string, membe
 
 var groupRebuildInterval = 60 * time.Second
 
+const backfillEveryTicks = 10
+
 // runGroupRebuild re-projects every group from MySQL into WuKong on boot and every
-// groupRebuildInterval (UNI-IM-DB W3). It runs beside the inbox worker, not inside it, so a
+// groupRebuildInterval (UNI-IM-DB W3), then runs the message backfill when it is due (W4). It runs beside the inbox worker, not inside it, so a
 // WuKong outage (5 s timeout per group) cannot stall agent dispatch.
 func (p *Plugin) runGroupRebuild(ctx context.Context) {
 	defer p.wg.Done()
 	ticker := time.NewTicker(groupRebuildInterval)
 	defer ticker.Stop()
-	for {
+	for tick := 0; ; tick++ {
 		p.reconcileWuKongGroups(ctx, global.PRISM_DB)
+		// W4 backfill: due on boot, after a failed save, and every backfillEveryTicks (a batch the
+		// old pod dropped during a roll lands after the new pod's boot pass). An unreachable
+		// WuKong leaves it due, so the next tick retries.
+		if tick%backfillEveryTicks == 0 {
+			p.backfillDue.Store(true)
+		}
+		if p.backfillDue.Swap(false) && !p.backfillMessages(ctx, global.PRISM_DB) {
+			p.backfillDue.Store(true)
+		}
 		select {
 		case <-ctx.Done():
 			return

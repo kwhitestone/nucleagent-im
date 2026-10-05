@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -38,6 +39,7 @@ type Plugin struct {
 	managerToken        string
 	managerTokenExpiry  time.Time
 	webhookAdmission    webhookAdmission
+	backfillDue         atomic.Bool
 	cancel              context.CancelFunc
 	done                chan struct{}
 	wg                  sync.WaitGroup
@@ -114,9 +116,8 @@ type ConnectOutput struct {
 
 type ConversationListInput struct {
 	Body struct {
-		Cursor            string `json:"cursor,omitempty"`
-		Limit             int    `json:"limit,omitempty"`
-		CompletedCoverage int64  `json:"completed_coverage,omitempty"`
+		Cursor string `json:"cursor,omitempty"`
+		Limit  int    `json:"limit,omitempty"`
 	}
 }
 
@@ -128,7 +129,7 @@ type MessageSyncInput struct {
 		EndMessageSeq   uint64 `json:"end_message_seq,omitempty"`
 		PullMode        int    `json:"pull_mode,omitempty"`
 		Limit           int    `json:"limit,omitempty"`
-		StreamV2        int    `json:"stream_v2,omitempty"`
+		StreamV2        int    `json:"stream_v2,omitempty"` // accepted for compatibility; streams are not stored
 	}
 }
 
@@ -280,6 +281,7 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 	p.registerGroups(api)
 	p.registerRecipients(api)
 	p.registerAgents(api)
+	p.registerReads(api)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "imHealth",
@@ -315,58 +317,12 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 			Data: ConnectData{UID: uid, Token: token, WSAddr: p.wsAddr},
 		}}, nil
 	})
-
-	huma.Register(api, huma.Operation{
-		OperationID: "imConversationList",
-		Method:      http.MethodPost,
-		Path:        "/api/v1/im/conversation/list",
-		Summary:     "List WuKongIM conversations",
-		Tags:        []string{"IM"},
-		Security:    []map[string][]string{{"AuthTokenAuth": {}}},
-	}, func(ctx context.Context, input *ConversationListInput) (*ProxyOutput, error) {
-		body := map[string]any{
-			"uid":                strconv.FormatUint(uint64(ctx.Value(userIDKey).(uint)), 10),
-			"cursor":             input.Body.Cursor,
-			"limit":              input.Body.Limit,
-			"completed_coverage": input.Body.CompletedCoverage,
-		}
-		return p.proxy(ctx, "/conversation/list", body)
-	})
-
-	huma.Register(api, huma.Operation{
-		OperationID: "imChannelMessageSync",
-		Method:      http.MethodPost,
-		Path:        "/api/v1/im/channel/messagesync",
-		Summary:     "Sync WuKongIM channel messages",
-		Tags:        []string{"IM"},
-		Security:    []map[string][]string{{"AuthTokenAuth": {}}},
-	}, func(ctx context.Context, input *MessageSyncInput) (*ProxyOutput, error) {
-		body := map[string]any{
-			"login_uid":         strconv.FormatUint(uint64(ctx.Value(userIDKey).(uint)), 10),
-			"channel_id":        input.Body.ChannelID,
-			"channel_type":      input.Body.ChannelType,
-			"start_message_seq": input.Body.StartMessageSeq,
-			"end_message_seq":   input.Body.EndMessageSeq,
-			"pull_mode":         input.Body.PullMode,
-			"limit":             input.Body.Limit,
-			"stream_v2":         input.Body.StreamV2,
-		}
-		return p.proxy(ctx, "/channel/messagesync", body)
-	})
 }
 
 func registerToken(ctx context.Context, apiAddr, uid, token string) error {
 	return postWuKong(ctx, apiAddr, "/user/token", map[string]any{
 		"uid": uid, "token": token, "device_flag": 1, "device_level": 1,
 	}, nil)
-}
-
-func (p *Plugin) proxy(ctx context.Context, path string, body any) (*ProxyOutput, error) {
-	var output any
-	if err := postWuKong(ctx, p.apiAddr, path, body, &output); err != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "WuKongIM is unavailable")
-	}
-	return &ProxyOutput{Body: output}, nil
 }
 
 func postWuKong(ctx context.Context, apiAddr, path string, input, output any) error {

@@ -530,7 +530,7 @@ func TestParticipantAuthorization(t *testing.T) {
 	}
 }
 
-func TestInitialHistoryUsesAuthOrdersAndFilters(t *testing.T) {
+func TestInitialHistoryReadsMySQLOrdersAndFilters(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 2, authmodel.AccountTypeHuman)
@@ -539,26 +539,27 @@ func TestInitialHistoryUsesAuthOrdersAndFilters(t *testing.T) {
 		payload, _ := json.Marshal(map[string]any{"type": wuKongTextType, "content": content})
 		return payload
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		username, password, ok := r.BasicAuth()
-		if !ok || username != "admin" || password != "password" {
-			t.Fatalf("history request basic auth invalid")
+	// W4: the context comes from im_messages, oldest first by id; WuKong is not called.
+	for _, m := range []IMMessage{
+		{MessageIDStr: "1", FromUID: 1, Payload: string(text("first"))},
+		{MessageIDStr: "2", FromUID: 2, Setting: 2, Payload: string(text("stream"))},
+		{MessageIDStr: "3", FromUID: 42, Payload: string(text("third"))},
+		{MessageIDStr: "4", FromUID: 1, Payload: string(text("trigger"))},
+		{MessageIDStr: "5", FromUID: 1, ChannelKey: "g-other", Payload: string(text("other channel"))},
+	} {
+		if m.ChannelKey == "" {
+			m.ChannelKey = "g1"
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"messages": []map[string]any{
-			{"message_idstr": "3", "message_seq": 3, "from_uid": "42", "payload": text("third")},
-			{"message_idstr": "2", "message_seq": 2, "from_uid": "2", "setting": 2, "payload": text("stream")},
-			{"message_idstr": "4", "message_seq": 4, "from_uid": "1", "payload": text("trigger")},
-			{"message_idstr": "1", "message_seq": 1, "from_uid": "1", "payload": text("first")},
-		}})
-	}))
-	defer server.Close()
+		m.ChannelType, m.PayloadType = groupChannel, wuKongTextType
+		if err := db.Create(&m).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	row := &IMWebhookInbox{
 		MessageIDStr: "4", SenderUID: 1, TargetAgentUID: 42, ChannelID: "g1",
 		ChannelType: groupChannel, ExecutionOwnerUserID: 1,
 	}
-	p := &Plugin{
-		apiAddr: server.URL, wuKongAdminUser: "admin", wuKongAdminPassword: "password",
-	}
+	p := &Plugin{apiAddr: "http://127.0.0.1:1"} // unreachable: a WuKong call would fail the test
 	turns, err := p.initialHistory(t.Context(), row)
 	if err != nil {
 		t.Fatal(err)

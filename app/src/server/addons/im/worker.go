@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -64,16 +63,6 @@ type historyTurn struct {
 	SpeakerUID  string `json:"speakerUid"`
 	SpeakerName string `json:"speakerName"`
 	Content     string `json:"content"`
-}
-
-type wuKongSyncResponse struct {
-	Messages []struct {
-		MessageIDStr string `json:"message_idstr"`
-		MessageSeq   uint64 `json:"message_seq"`
-		FromUID      string `json:"from_uid"`
-		Setting      uint8  `json:"setting"`
-		Payload      []byte `json:"payload"`
-	} `json:"messages"`
 }
 
 func (p *Plugin) runWorker(ctx context.Context) {
@@ -258,20 +247,10 @@ func (p *Plugin) initialHistory(ctx context.Context, row *IMWebhookInbox) ([]his
 		Count(&count).Error; err != nil || count != 0 {
 		return nil, err
 	}
-	var synced wuKongSyncResponse
-	err := postWuKongWithAuth(ctx, p.apiAddr, "/channel/messagesync",
-		p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-			"login_uid": strconv.FormatUint(uint64(row.SenderUID), 10), "channel_id": row.ChannelID,
-			"channel_type": row.ChannelType, "limit": 30, "pull_mode": 1,
-		}, &synced)
+	// W4: the starting context reads MySQL (the latest 30 of the channel), not WuKong.
+	recent, _, err := channelMessages(global.PRISM_DB.WithContext(ctx), row.ChannelType, row.ChannelID, 0, 0, 0, 30)
 	if err != nil {
 		return nil, err
-	}
-	sort.SliceStable(synced.Messages, func(i, j int) bool {
-		return synced.Messages[i].MessageSeq < synced.Messages[j].MessageSeq
-	})
-	if len(synced.Messages) > 30 {
-		synced.Messages = synced.Messages[len(synced.Messages)-30:]
 	}
 	names := map[uint]string{}
 	var users []authmodel.User
@@ -283,25 +262,23 @@ func (p *Plugin) initialHistory(ctx context.Context, row *IMWebhookInbox) ([]his
 			}
 		}
 	}
-	candidates := make([]historyTurn, 0, len(synced.Messages))
-	for i := range synced.Messages {
-		message := synced.Messages[i]
+	candidates := make([]historyTurn, 0, len(recent))
+	for _, message := range recent {
 		if message.MessageIDStr == row.MessageIDStr || message.Setting == 2 {
 			continue
 		}
 		var payload textPayload
-		if json.Unmarshal(message.Payload, &payload) != nil || payload.Type != wuKongTextType ||
+		if json.Unmarshal([]byte(message.Payload), &payload) != nil || payload.Type != wuKongTextType ||
 			strings.TrimSpace(payload.Content) == "" {
 			continue
 		}
-		uid64, _ := strconv.ParseUint(message.FromUID, 10, 64)
 		role := "user"
-		if uint(uid64) == row.TargetAgentUID {
+		if message.FromUID == row.TargetAgentUID {
 			role = "assistant"
 		}
-		content := strings.TrimSpace(payload.Content)
 		candidates = append(candidates, historyTurn{
-			Role: role, SpeakerUID: message.FromUID, SpeakerName: names[uint(uid64)], Content: content,
+			Role: role, SpeakerUID: strconv.FormatUint(uint64(message.FromUID), 10),
+			SpeakerName: names[message.FromUID], Content: strings.TrimSpace(payload.Content),
 		})
 	}
 	turns := make([]historyTurn, 0, len(candidates))

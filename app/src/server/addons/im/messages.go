@@ -17,7 +17,8 @@ import (
 func persistWebhookMessages(ctx context.Context, db *gorm.DB, messages []webhookMessage) error {
 	for i := range messages {
 		if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			return persistMessage(tx, messages[i])
+			_, err := persistMessage(tx, messages[i])
+			return err
 		}); err != nil {
 			return err
 		}
@@ -25,14 +26,15 @@ func persistWebhookMessages(ctx context.Context, db *gorm.DB, messages []webhook
 	return nil
 }
 
-func persistMessage(tx *gorm.DB, message webhookMessage) error {
+// persistMessage reports whether the message was new (false: skipped or already saved).
+func persistMessage(tx *gorm.DB, message webhookMessage) (bool, error) {
 	idStr := strings.TrimSpace(message.MessageIDStr)
 	fromUID, err := strconv.ParseUint(strings.TrimSpace(message.FromUID), 10, 64)
 	if err != nil || fromUID == 0 || idStr == "" {
-		return nil
+		return false, nil
 	}
 	if h := message.Header; h != nil && (h.NoPersist == 1 || h.SyncOnce == 1) {
-		return nil
+		return false, nil
 	}
 	sender := uint(fromUID)
 	key := strings.TrimSpace(message.ChannelID)
@@ -40,15 +42,15 @@ func persistMessage(tx *gorm.DB, message webhookMessage) error {
 	case personChannel:
 		canonical, _, ok := canonicalPersonChannel(key, sender)
 		if !ok {
-			return nil
+			return false, nil
 		}
 		key = canonical
 	case groupChannel:
 		if key == "" {
-			return nil
+			return false, nil
 		}
 	default:
-		return nil
+		return false, nil
 	}
 
 	var head struct {
@@ -63,7 +65,7 @@ func persistMessage(tx *gorm.DB, message webhookMessage) error {
 	}
 	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
 	if result.Error != nil || result.RowsAffected == 0 {
-		return result.Error // 0 rows: a redelivery, already persisted and fanned out
+		return false, result.Error // 0 rows: a redelivery, already persisted and fanned out
 	}
 
 	var viewers []uint
@@ -73,25 +75,28 @@ func persistMessage(tx *gorm.DB, message webhookMessage) error {
 		right, _ := strconv.ParseUint(pair[1], 10, 64)
 		viewers = []uint{uint(left), uint(right)}
 	} else if err := tx.Model(&IMGroupMember{}).Where("group_id = ?", key).Pluck("uid", &viewers).Error; err != nil {
-		return err
+		return true, err
 	}
 	if len(viewers) == 0 {
-		return nil // unknown group: the message row only
+		return true, nil // unknown group: the message row only
 	}
 	rows := make([]IMConversation, len(viewers))
 	for i, uid := range viewers {
 		rows[i] = IMConversation{UID: uid, ChannelType: message.ChannelType, ChannelKey: key, LastMessageID: row.ID}
 	}
 	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error; err != nil {
-		return err
+		return true, err
 	}
 	// Q2 ruling: every message not sent by the viewer counts as unread, agent replies
 	// included (WK's red_dot:0 on API sends is ignored). The CASE keeps the newest id when
-	// concurrent batches commit out of order; it is portable where GREATEST is not.
-	return tx.Model(&IMConversation{}).
+	// concurrent batches commit out of order; it is portable where GREATEST is not. A message
+	// older than the current last one (a W4 backfill gets a fresh, higher id) never becomes
+	// the preview.
+	return true, tx.Model(&IMConversation{}).
 		Where("channel_type = ? AND channel_key = ? AND uid IN ?", message.ChannelType, key, viewers).
 		Updates(map[string]any{
-			"unread":          gorm.Expr("unread + CASE WHEN uid = ? THEN 0 ELSE 1 END", sender),
-			"last_message_id": gorm.Expr("CASE WHEN last_message_id < ? THEN ? ELSE last_message_id END", row.ID, row.ID),
+			"unread": gorm.Expr("unread + CASE WHEN uid = ? THEN 0 ELSE 1 END", sender),
+			"last_message_id": gorm.Expr("CASE WHEN last_message_id < ? AND COALESCE((SELECT wk_timestamp FROM im_messages WHERE id = last_message_id), 0) <= ? THEN ? ELSE last_message_id END",
+				row.ID, row.WKTimestamp, row.ID),
 		}).Error
 }

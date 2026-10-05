@@ -99,19 +99,6 @@ func TestPostWuKong(t *testing.T) {
 	}
 }
 
-func TestWuKongProxyUsesDomainError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		response.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-
-	_, err := (&Plugin{apiAddr: server.URL}).proxy(t.Context(), "/conversation/list", map[string]any{"uid": "42"})
-	problem, ok := err.(*imProblem)
-	if !ok || problem.Status != http.StatusServiceUnavailable || problem.Code != "wukong_unavailable" {
-		t.Fatalf("problem=%#v", err)
-	}
-}
-
 func TestBadJWTRejected(t *testing.T) {
 	router := gin.New()
 	sharedAuthStack(t, router)
