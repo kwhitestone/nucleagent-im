@@ -91,6 +91,41 @@ type IMGroupMember struct {
 
 func (IMGroupMember) TableName() string { return "im_group_members" }
 
+// IMMessage is every persisted message (UNI-IM-DB W2). ID is the history cursor (JS-safe,
+// survives WK resets); message_idstr is the dedup key. idx_im_msg_channel
+// (channel_type, channel_key, id) serves every history query.
+type IMMessage struct {
+	ID           uint64 `gorm:"primaryKey"`
+	MessageIDStr string `gorm:"column:message_idstr;size:32;not null;uniqueIndex"`
+	ClientMsgNo  string `gorm:"size:128;index"`
+	ChannelKey   string `gorm:"size:191;not null;index:idx_im_msg_channel,priority:2"`
+	ChannelType  uint8  `gorm:"not null;index:idx_im_msg_channel,priority:1"`
+	FromUID      uint   `gorm:"not null"`
+	PayloadType  int    `gorm:"not null"`
+	Payload      string `gorm:"type:mediumtext;not null"`
+	Setting      uint8  `gorm:"not null;default:0"`
+	WKTimestamp  int64  `gorm:"column:wk_timestamp;not null"`
+	WKMessageSeq int64  `gorm:"column:wk_message_seq;not null;default:0"`
+	CreatedAt    time.Time
+}
+
+func (IMMessage) TableName() string { return "im_messages" }
+
+// IMConversation is one row per (viewer, channel), written on persist (fan-out on write).
+// uidx_im_conv serves the upsert and mark-read; idx_im_conv_recent (uid, last_message_id)
+// serves the keyset-paged conversation list.
+type IMConversation struct {
+	ID            uint64 `gorm:"primaryKey"`
+	UID           uint   `gorm:"not null;uniqueIndex:uidx_im_conv,priority:1;index:idx_im_conv_recent,priority:1"`
+	ChannelType   uint8  `gorm:"not null;uniqueIndex:uidx_im_conv,priority:2"`
+	ChannelKey    string `gorm:"size:191;not null;uniqueIndex:uidx_im_conv,priority:3"`
+	LastMessageID uint64 `gorm:"not null;index:idx_im_conv_recent,priority:2"`
+	Unread        int    `gorm:"not null;default:0"`
+	UpdatedAt     time.Time
+}
+
+func (IMConversation) TableName() string { return "im_conversations" }
+
 type IMGroupAgentAllowlist struct {
 	ID                uint   `gorm:"primaryKey"`
 	GroupID           string `gorm:"size:191;not null;uniqueIndex:uidx_im_group_allow"`

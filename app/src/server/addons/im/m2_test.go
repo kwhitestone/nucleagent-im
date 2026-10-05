@@ -34,6 +34,7 @@ func m2DB(t *testing.T) *gorm.DB {
 		&authmodel.User{}, &model.AgentInstance{}, &model.AgentTemplate{},
 		&IMWebhookInbox{}, &IMCoreConversationMap{}, &IMGroup{},
 		&IMGroupAgentAllowlist{}, &IMRateWindow{}, &IMGroupMember{},
+		&IMMessage{}, &IMConversation{},
 	); err != nil {
 		t.Fatal(err)
 	}

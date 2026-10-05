@@ -236,6 +236,8 @@ func (p *Plugin) Models() []interface{} {
 		&IMGroupAgentAllowlist{},
 		&IMRateWindow{},
 		&IMGroupMember{},
+		&IMMessage{},
+		&IMConversation{},
 	}
 }
 

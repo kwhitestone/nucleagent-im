@@ -149,9 +149,6 @@ func (p *Plugin) registerWebhook(api huma.API) {
 		if !capabilityMatches(capability, p.webhookCapability) {
 			return nil, newWebhookProblem(http.StatusUnauthorized, "im_webhook_unauthorized", "invalid webhook capability")
 		}
-		if !p.webhookAdmission.allow(time.Now()) {
-			return nil, newWebhookProblem(http.StatusTooManyRequests, "im_webhook_rate_limited", "webhook rate limit exceeded")
-		}
 		if input.Event != "msg.notify" {
 			return nil, newWebhookProblem(http.StatusBadRequest, "im_webhook_event_unsupported", "unsupported webhook event")
 		}
@@ -161,6 +158,14 @@ func (p *Plugin) registerWebhook(api huma.API) {
 			body = strings.ReplaceAll(body, p.webhookCapability, "[REDACTED]")
 			slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})).
 				Debug("im_webhook_debug_body", "event", input.Event, "body", body)
+		}
+		// Persistence first: the admission cap below gates agent triggers only, never the save.
+		if err := persistWebhookMessages(ctx, global.PRISM_DB, input.Body); err != nil {
+			slog.Error("im message persist failed", "error", err)
+			return nil, newWebhookProblem(http.StatusServiceUnavailable, "im_inbox_unavailable", "webhook could not be recorded")
+		}
+		if !p.webhookAdmission.allow(time.Now()) {
+			return nil, newWebhookProblem(http.StatusTooManyRequests, "im_webhook_rate_limited", "webhook rate limit exceeded")
 		}
 		accepted, err := acceptWebhookBatch(ctx, global.PRISM_DB, input.Event, input.Body, time.Now(), groupMembers)
 		if errors.Is(err, errA2ADepthExceeded) {
