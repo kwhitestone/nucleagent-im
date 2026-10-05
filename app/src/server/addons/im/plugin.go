@@ -254,6 +254,8 @@ func (p *Plugin) Start(ctx context.Context) error {
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.done = make(chan struct{})
 	go p.runWorker(ctx)
+	p.wg.Add(1)
+	go p.runGroupRebuild(ctx)
 	return nil
 }
 

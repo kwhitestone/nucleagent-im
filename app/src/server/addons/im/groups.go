@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
@@ -339,7 +340,7 @@ func (p *Plugin) deleteGroup(ctx context.Context, input *groupIDInput) (*emptyOu
 		return postWuKongWithAuth(ctx, p.apiAddr, "/channel/delete", p.wuKongAdminUser, p.wuKongAdminPassword,
 			map[string]any{"channel_id": group.GroupID, "channel_type": groupChannel}, nil)
 	}, func(ctx context.Context) {
-		p.restoreWuKongGroup(ctx, group.GroupID, members)
+		_ = p.restoreWuKongGroup(ctx, group.GroupID, members)
 	}); err != nil {
 		return nil, err
 	}
@@ -730,10 +731,68 @@ func (p *Plugin) wuKongGroupMembers(ctx context.Context, channelID string) ([]ui
 	return members, nil
 }
 
-func (p *Plugin) restoreWuKongGroup(ctx context.Context, channelID string, members []uint) {
-	_ = postWuKongWithAuth(ctx, p.apiAddr, "/channel", p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
+func (p *Plugin) restoreWuKongGroup(ctx context.Context, channelID string, members []uint) error {
+	return postWuKongWithAuth(ctx, p.apiAddr, "/channel", p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
 		"channel_id": channelID, "channel_type": groupChannel, "reset": 1, "subscribers": uidStrings(members),
 	}, nil)
+}
+
+var groupRebuildInterval = 60 * time.Second
+
+// runGroupRebuild re-projects every group from MySQL into WuKong on boot and every
+// groupRebuildInterval (UNI-IM-DB W3). It runs beside the inbox worker, not inside it, so a
+// WuKong outage (5 s timeout per group) cannot stall agent dispatch.
+func (p *Plugin) runGroupRebuild(ctx context.Context) {
+	defer p.wg.Done()
+	ticker := time.NewTicker(groupRebuildInterval)
+	defer ticker.Stop()
+	for {
+		p.reconcileWuKongGroups(ctx, global.PRISM_DB)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// reconcileWuKongGroups posts /channel reset:1 with the DB members for every group. reset
+// replaces WuKong's subscriber set, so a re-run converges and adds nothing. It only reads
+// the DB; a failed group is logged and retried on the next tick.
+// ponytail: one WK call per group per tick; switch to a reset-detect trigger once group count makes that visible.
+func (p *Plugin) reconcileWuKongGroups(ctx context.Context, db *gorm.DB) {
+	var groups []string
+	var rows []IMGroupMember
+	if err := db.WithContext(ctx).Model(&IMGroup{}).Order("id ASC").Pluck("group_id", &groups).Error; err != nil {
+		slog.Warn("im group rebuild skipped", "error", err)
+		return
+	}
+	if err := db.WithContext(ctx).Order("uid ASC").Find(&rows).Error; err != nil {
+		slog.Warn("im group rebuild skipped", "error", err)
+		return
+	}
+	members := map[string][]uint{}
+	for _, row := range rows {
+		members[row.GroupID] = append(members[row.GroupID], row.UID)
+	}
+	failed := 0
+	for _, groupID := range groups {
+		if ctx.Err() != nil {
+			return
+		}
+		if len(members[groupID]) == 0 {
+			// Not yet filled (W1 fill pending): WuKong holds the only member copy; reset:1 would wipe it.
+			continue
+		}
+		if err := p.restoreWuKongGroup(ctx, groupID, members[groupID]); err != nil {
+			failed++
+			// Upstream errors can contain credentials or response bodies; log the group only.
+			slog.Warn("im group rebuild failed", "channel_id", groupID)
+		}
+	}
+	if failed > 0 {
+		slog.Warn("im group rebuild", "groups", len(groups), "failed", failed)
+	}
 }
 
 func newGroupChannelID() (string, error) {
