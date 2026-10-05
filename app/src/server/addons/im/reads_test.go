@@ -353,11 +353,13 @@ func TestBackfillFillsGapsIdempotently(t *testing.T) {
 	}
 	dm := history("1@2", personChannel, 5, 1, 2)
 	group := history("g1", groupChannel, 3, 3, 4)
+	preW2 := webhookText("g1#0", 4, "g1", groupChannel, "before persistence began")
+	preW2.MessageSeq, preW2.Timestamp = 1, group[0].Timestamp-3600
 	stale := history("1@9", personChannel, 2, 1, 9)
 	for i := range stale {
 		stale[i].Timestamp -= 8 * 24 * 3600 // outside the 7-day window
 	}
-	fake.channels["1@2"], fake.channels["g1"], fake.channels["1@9"] = dm, group, stale
+	fake.channels["1@2"], fake.channels["g1"], fake.channels["1@9"] = dm, append([]webhookMessage{preW2}, group...), stale
 	// The webhook delivered DM 1, 2, 4 (3 and 5 were lost while im was down; DM 4 is from uid 2,
 	// the reader the backfill uses), the whole group,
 	// and the stale DM's first message.
@@ -372,6 +374,11 @@ func TestBackfillFillsGapsIdempotently(t *testing.T) {
 	}
 	if got := storedIDs(t, db, "1@9"); got != "1@9#1" {
 		t.Fatalf("stale channel was backfilled: %s", got)
+	}
+	// Pre-persistence history (older than the channel's first saved row) is never imported: the
+	// one-time reset at the cutover, not a gap, and it would inflate unread.
+	if got := storedIDs(t, db, "g1"); got != "g1#1,g1#2,g1#3" {
+		t.Fatalf("group=%s", got)
 	}
 	if fake.calls["1@9"] != 0 || fake.logins["g1"] != "3" || fake.logins["1@2"] != "2" {
 		t.Fatalf("calls=%v logins=%v", fake.calls, fake.logins)
@@ -459,9 +466,9 @@ func TestBackfillOrdersByTimestampAcrossWKReset(t *testing.T) {
 	p := &Plugin{apiAddr: fake.serve(t)}
 	dm := history("1@2", personChannel, 4, 1, 2)
 	dm[0].MessageSeq, dm[1].MessageSeq = 900, 901 // before the reset
-	dm[2].MessageSeq, dm[3].MessageSeq = 1, 2     // after it
+	dm[2].MessageSeq, dm[3].MessageSeq = 1, 2     // after it: seq order would put #3 before #2
 	fake.channels["1@2"] = dm
-	mustOK(t, post(dm[3]))
+	mustOK(t, post(dm[0], dm[3])) // #2 and #3 were lost
 	if !p.backfillMessages(t.Context(), db) {
 		t.Fatal("backfill")
 	}
@@ -469,7 +476,7 @@ func TestBackfillOrdersByTimestampAcrossWKReset(t *testing.T) {
 	if err := db.Model(&IMMessage{}).Where("channel_key = ?", "1@2").Order("id ASC").Pluck("message_idstr", &ids).Error; err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(ids, ",") != "1@2#4,1@2#1,1@2#2,1@2#3" {
-		t.Fatalf("id order=%v (the backfilled three must keep time order)", ids)
+	if strings.Join(ids, ",") != "1@2#1,1@2#4,1@2#2,1@2#3" {
+		t.Fatalf("id order=%v (the backfilled two must keep time order)", ids)
 	}
 }

@@ -300,16 +300,18 @@ const (
 
 // backfillMessages returns false when WuKong was unreachable, so the caller retries next tick.
 // ponytail: one WuKong call per active channel per pass, and the channel pick scans im_messages
-// (no wk_timestamp index); gaps older than the latest 100 per channel or in channels idle for
-// 7 days are not covered. Add the index / widen when the table or a real loss shows up there.
+// (no wk_timestamp index); gaps older than the latest 100 per channel, in channels idle for
+// 7 days, or in a channel whose every message was lost are not covered. Add the index / widen
+// when the table or a real loss shows up there.
 func (p *Plugin) backfillMessages(ctx context.Context, db *gorm.DB) bool {
 	var channels []struct {
 		ChannelType uint8
 		ChannelKey  string
 		LastID      uint64
+		FirstTS     int64
 	}
 	if err := db.WithContext(ctx).Model(&IMMessage{}).
-		Select("channel_type, channel_key, MAX(id) AS last_id").
+		Select("channel_type, channel_key, MAX(id) AS last_id, MIN(wk_timestamp) AS first_ts").
 		Where("wk_timestamp >= ?", time.Now().Add(-backfillWindow).Unix()).
 		Group("channel_type, channel_key").Order("last_id DESC").Limit(backfillMaxChannels).
 		Scan(&channels).Error; err != nil {
@@ -321,7 +323,7 @@ func (p *Plugin) backfillMessages(ctx context.Context, db *gorm.DB) bool {
 		if ctx.Err() != nil {
 			return true
 		}
-		n, err := p.backfillChannel(ctx, db, ch.ChannelType, ch.ChannelKey, ch.LastID)
+		n, err := p.backfillChannel(ctx, db, ch.ChannelType, ch.ChannelKey, ch.LastID, ch.FirstTS)
 		added += n
 		var status *httpStatusError
 		if err != nil && !errors.As(err, &status) && ctx.Err() == nil {
@@ -340,7 +342,10 @@ func (p *Plugin) backfillMessages(ctx context.Context, db *gorm.DB) bool {
 	return true
 }
 
-func (p *Plugin) backfillChannel(ctx context.Context, db *gorm.DB, channelType uint8, key string, lastID uint64) (int, error) {
+// Only messages at or after the channel's first saved one are taken: the backfill repairs
+// webhook-loss gaps; history from before persistence began is the accepted one-time reset
+// (spec §2.5), and importing it would count it all as unread at the cutover.
+func (p *Plugin) backfillChannel(ctx context.Context, db *gorm.DB, channelType uint8, key string, lastID uint64, firstTS int64) (int, error) {
 	// Read as someone WuKong certainly counts as a member: a DM's last sender, a group's DB member.
 	var reader uint
 	var err error
@@ -379,7 +384,7 @@ func (p *Plugin) backfillChannel(ctx context.Context, db *gorm.DB, channelType u
 	})
 	added := 0
 	for _, m := range synced.Messages {
-		if slices.Contains(have, m.MessageIDStr) {
+		if m.Timestamp < firstTS || slices.Contains(have, m.MessageIDStr) {
 			continue
 		}
 		m.ChannelID = key // WuKong renders a DM as the peer uid; persist wants the pair
