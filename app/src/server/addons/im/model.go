@@ -79,6 +79,18 @@ type IMGroup struct {
 
 func (IMGroup) TableName() string { return "im_groups" }
 
+// IMGroupMember is group membership, owned by im (UNI-IM-DB W1); WuKong subscribers are
+// a projection of it. (group_id, uid) serves member lists and membership checks; the uid
+// index serves "the caller's groups".
+type IMGroupMember struct {
+	ID        uint   `gorm:"primaryKey"`
+	GroupID   string `gorm:"size:191;not null;uniqueIndex:uidx_im_group_member,priority:1"`
+	UID       uint   `gorm:"not null;uniqueIndex:uidx_im_group_member,priority:2;index"`
+	CreatedAt time.Time
+}
+
+func (IMGroupMember) TableName() string { return "im_group_members" }
+
 type IMGroupAgentAllowlist struct {
 	ID                uint   `gorm:"primaryKey"`
 	GroupID           string `gorm:"size:191;not null;uniqueIndex:uidx_im_group_allow"`

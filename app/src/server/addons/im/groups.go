@@ -18,6 +18,7 @@ import (
 	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
 	"github.com/kwhitestone/prism-fusion/global"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const maxGroupMembers = 100
@@ -193,56 +194,37 @@ func (p *Plugin) createGroup(ctx context.Context, input *groupInput) (*groupOutp
 		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group could not be created")
 	}
 	group := IMGroup{GroupID: channelID, Title: title, CreatorUID: creator}
-	if global.PRISM_DB == nil || global.PRISM_DB.WithContext(ctx).Create(&group).Error != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group could not be created")
-	}
-	subscribers := uidStrings(members)
-	err = postWuKongWithAuth(ctx, p.apiAddr, "/channel", p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-		"channel_id": channelID, "channel_type": groupChannel, "reset": 1, "subscribers": subscribers,
-	}, nil)
-	if err != nil {
-		_ = postWuKongWithAuth(context.WithoutCancel(ctx), p.apiAddr, "/channel/delete",
-			p.wuKongAdminUser, p.wuKongAdminPassword,
+	err = membershipWrite(ctx, func(tx *gorm.DB) error {
+		if err := tx.Create(&group).Error; err != nil {
+			return err
+		}
+		return insertGroupMembers(tx, channelID, members)
+	}, func(ctx context.Context) error {
+		return postWuKongWithAuth(ctx, p.apiAddr, "/channel", p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
+			"channel_id": channelID, "channel_type": groupChannel, "reset": 1, "subscribers": uidStrings(members),
+		}, nil)
+	}, func(ctx context.Context) {
+		_ = postWuKongWithAuth(ctx, p.apiAddr, "/channel/delete", p.wuKongAdminUser, p.wuKongAdminPassword,
 			map[string]any{"channel_id": channelID, "channel_type": groupChannel}, nil)
-		_ = global.PRISM_DB.Delete(&group).Error
-		p.cleanupWuKongGroupSubscribers(context.WithoutCancel(ctx), channelID, members)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		p.cleanupWuKongGroupSubscribers(ctx, channelID, members)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return groupResponse(group), nil
 }
 
 func (p *Plugin) listGroups(ctx context.Context, _ *struct{}) (*groupsOutput, error) {
 	var groups []IMGroup
-	if global.PRISM_DB == nil || global.PRISM_DB.WithContext(ctx).Order("id DESC").Find(&groups).Error != nil {
+	if global.PRISM_DB == nil || global.PRISM_DB.WithContext(ctx).
+		Joins("JOIN im_group_members ON im_group_members.group_id = im_groups.group_id").
+		Where("im_group_members.uid = ?", ctx.Value(userIDKey).(uint)).
+		Order("im_groups.id DESC").Find(&groups).Error != nil {
 		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "groups are unavailable")
 	}
-	caller := ctx.Value(userIDKey).(uint)
-	out := make([]groupData, 0, len(groups))
-	// ponytail: one Manager lookup per local group; add a membership index only when group counts require it.
-	// A failed lookup skips that group: a WuKong wipe leaves im rows with no channel, and one dead
-	// row must not fail every user's list. Only a Manager that answered nothing at all is a 503.
-	answered, outage := false, false
+	out := make([]groupData, len(groups))
 	for i := range groups {
-		members, err := p.wuKongGroupMembers(ctx, groups[i].GroupID)
-		if err != nil {
-			status := 0
-			var upstream *httpStatusError
-			if errors.As(err, &upstream) {
-				status = upstream.status
-			}
-			outage = outage || status != http.StatusNotFound
-			// Upstream errors can contain credentials or response bodies; log the status only.
-			slog.Warn("im group skipped: wukong membership lookup failed",
-				"group_id", groups[i].ID, "channel_id", groups[i].GroupID, "status", status)
-			continue
-		}
-		answered = true
-		if containsUID(members, caller) {
-			out = append(out, groupDTO(groups[i]))
-		}
-	}
-	if outage && !answered {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		out[i] = groupDTO(groups[i])
 	}
 	return &groupsOutput{Body: envelope[[]groupData]{Code: 0, Message: "success", Data: out}}, nil
 }
@@ -265,9 +247,9 @@ func (p *Plugin) addGroupMembers(ctx context.Context, input *groupMembersInput) 
 	if err := validateUsers(ctx, members, "member_not_found", "one or more members do not exist"); err != nil {
 		return nil, err
 	}
-	current, err := p.wuKongGroupMembers(ctx, group.GroupID)
+	current, err := groupMembers(ctx, group.GroupID)
 	if err != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group members are unavailable")
 	}
 	for _, uid := range members {
 		if containsUID(current, uid) {
@@ -277,15 +259,14 @@ func (p *Plugin) addGroupMembers(ctx context.Context, input *groupMembersInput) 
 	if len(current)+len(members) > maxGroupMembers {
 		return nil, newIMProblem(http.StatusBadRequest, "invalid_request", "group member limit exceeded")
 	}
-	if err := postWuKongWithAuth(ctx, p.apiAddr, "/channel/subscriber_add",
-		p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-			"channel_id": group.GroupID, "channel_type": groupChannel, "subscribers": uidStrings(members),
-		}, nil); err != nil {
-		_ = postWuKongWithAuth(context.WithoutCancel(ctx), p.apiAddr, "/channel/subscriber_remove",
-			p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-				"channel_id": group.GroupID, "channel_type": groupChannel, "subscribers": uidStrings(members),
-			}, nil)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+	if err := membershipWrite(ctx, func(tx *gorm.DB) error {
+		return insertGroupMembers(tx, group.GroupID, members)
+	}, func(ctx context.Context) error {
+		return p.postSubscribers(ctx, "/channel/subscriber_add", group.GroupID, members)
+	}, func(ctx context.Context) {
+		_ = p.postSubscribers(ctx, "/channel/subscriber_remove", group.GroupID, members)
+	}); err != nil {
+		return nil, err
 	}
 	return p.groupMembersResponse(ctx, group, append(current, members...))
 }
@@ -307,9 +288,9 @@ func (p *Plugin) removeGroupMember(ctx context.Context, input *groupMemberInput)
 		return nil, newIMProblem(http.StatusConflict, "creator_transfer_or_delete_required",
 			"the creator must transfer ownership or delete the group")
 	}
-	current, upstreamErr := p.wuKongGroupMembers(ctx, group.GroupID)
-	if upstreamErr != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+	current, err := groupMembers(ctx, group.GroupID)
+	if err != nil {
+		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group members are unavailable")
 	}
 	if caller != group.CreatorUID && !containsUID(current, caller) {
 		return nil, newIMProblem(http.StatusForbidden, "group_forbidden", "group membership is required")
@@ -317,27 +298,20 @@ func (p *Plugin) removeGroupMember(ctx context.Context, input *groupMemberInput)
 	if !containsUID(current, memberUID) {
 		return nil, newIMProblem(http.StatusNotFound, "member_not_found", "group member not found")
 	}
-	if err := postWuKongWithAuth(ctx, p.apiAddr, "/channel/subscriber_remove",
-		p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-			"channel_id": group.GroupID, "channel_type": groupChannel,
-			"subscribers": []string{strconv.FormatUint(uint64(memberUID), 10)},
-		}, nil); err != nil {
-		_ = postWuKongWithAuth(context.WithoutCancel(ctx), p.apiAddr, "/channel/subscriber_add",
-			p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-				"channel_id": group.GroupID, "channel_type": groupChannel,
-				"subscribers": []string{strconv.FormatUint(uint64(memberUID), 10)},
-			}, nil)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
-	}
-	if err := global.PRISM_DB.WithContext(ctx).
-		Where("group_id = ? AND (member_uid = ? OR agent_uid = ?)", group.GroupID, memberUID, memberUID).
-		Delete(&IMGroupAgentAllowlist{}).Error; err != nil {
-		_ = postWuKongWithAuth(context.WithoutCancel(ctx), p.apiAddr, "/channel/subscriber_add",
-			p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-				"channel_id": group.GroupID, "channel_type": groupChannel,
-				"subscribers": []string{strconv.FormatUint(uint64(memberUID), 10)},
-			}, nil)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group permissions could not be updated")
+	removed := []uint{memberUID}
+	if err := membershipWrite(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("group_id = ? AND uid = ?", group.GroupID, memberUID).
+			Delete(&IMGroupMember{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("group_id = ? AND (member_uid = ? OR agent_uid = ?)", group.GroupID, memberUID, memberUID).
+			Delete(&IMGroupAgentAllowlist{}).Error
+	}, func(ctx context.Context) error {
+		return p.postSubscribers(ctx, "/channel/subscriber_remove", group.GroupID, removed)
+	}, func(ctx context.Context) {
+		_ = p.postSubscribers(ctx, "/channel/subscriber_add", group.GroupID, removed)
+	}); err != nil {
+		return nil, err
 	}
 	return &emptyOutput{Body: envelope[any]{Code: 0, Message: "success", Data: nil}}, nil
 }
@@ -350,24 +324,24 @@ func (p *Plugin) deleteGroup(ctx context.Context, input *groupIDInput) (*emptyOu
 	if group.CreatorUID != ctx.Value(userIDKey).(uint) {
 		return nil, newIMProblem(http.StatusForbidden, "group_forbidden", "only the group creator may delete the group")
 	}
-	members, err := p.wuKongGroupMembers(ctx, group.GroupID)
+	members, err := groupMembers(ctx, group.GroupID)
 	if err != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group members are unavailable")
 	}
-	if err := postWuKongWithAuth(ctx, p.apiAddr, "/channel/delete",
-		p.wuKongAdminUser, p.wuKongAdminPassword,
-		map[string]any{"channel_id": group.GroupID, "channel_type": groupChannel}, nil); err != nil {
-		p.restoreWuKongGroup(context.WithoutCancel(ctx), group.GroupID, members)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
-	}
-	if err := global.PRISM_DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("group_id = ?", group.GroupID).Delete(&IMGroupAgentAllowlist{}).Error; err != nil {
-			return err
+	if err := membershipWrite(ctx, func(tx *gorm.DB) error {
+		for _, table := range []any{&IMGroupAgentAllowlist{}, &IMGroupMember{}} {
+			if err := tx.Where("group_id = ?", group.GroupID).Delete(table).Error; err != nil {
+				return err
+			}
 		}
 		return tx.Delete(&group).Error
+	}, func(ctx context.Context) error {
+		return postWuKongWithAuth(ctx, p.apiAddr, "/channel/delete", p.wuKongAdminUser, p.wuKongAdminPassword,
+			map[string]any{"channel_id": group.GroupID, "channel_type": groupChannel}, nil)
+	}, func(ctx context.Context) {
+		p.restoreWuKongGroup(ctx, group.GroupID, members)
 	}); err != nil {
-		p.restoreWuKongGroup(context.WithoutCancel(ctx), group.GroupID, members)
-		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group metadata could not be deleted")
+		return nil, err
 	}
 	p.cleanupWuKongGroupSubscribers(context.WithoutCancel(ctx), group.GroupID, members)
 	return &emptyOutput{Body: envelope[any]{Code: 0, Message: "success", Data: nil}}, nil
@@ -399,9 +373,9 @@ func (p *Plugin) listGroupMembers(ctx context.Context, input *groupIDInput) (*gr
 	if err != nil {
 		return nil, err
 	}
-	members, err := p.wuKongGroupMembers(ctx, group.GroupID)
+	members, err := groupMembers(ctx, group.GroupID)
 	if err != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group members are unavailable")
 	}
 	if !containsUID(members, ctx.Value(userIDKey).(uint)) {
 		return nil, newIMProblem(http.StatusForbidden, "group_forbidden", "group membership is required")
@@ -433,9 +407,9 @@ func (p *Plugin) replaceAllowlist(ctx context.Context, input *allowlistInput) (*
 			return nil, err
 		}
 	}
-	current, err := p.wuKongGroupMembers(ctx, group.GroupID)
+	current, err := groupMembers(ctx, group.GroupID)
 	if err != nil {
-		return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+		return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group members are unavailable")
 	}
 	if !containsUID(current, agentUID) {
 		return nil, newIMProblem(http.StatusNotFound, "agent_not_found", "agent is not a group member")
@@ -598,6 +572,111 @@ func (p *Plugin) groupMembersResponse(
 		Code: 0, Message: "success",
 		Data: groupMembersData{Group: groupDTO(group), Members: members},
 	}}, nil
+}
+
+// groupMembers reads a group's membership from im_group_members, the source of truth.
+// Its signature is groupMemberResolver, so the webhook mention path uses it directly.
+func groupMembers(ctx context.Context, groupID string) ([]uint, error) {
+	members := []uint{}
+	if global.PRISM_DB == nil {
+		return nil, errors.New("IM database is not initialized")
+	}
+	err := global.PRISM_DB.WithContext(ctx).Model(&IMGroupMember{}).
+		Where("group_id = ?", groupID).Order("uid ASC").Pluck("uid", &members).Error
+	return members, err
+}
+
+func isGroupMember(ctx context.Context, groupID string, uid uint) (bool, error) {
+	var count int64
+	if global.PRISM_DB == nil {
+		return false, errors.New("IM database is not initialized")
+	}
+	err := global.PRISM_DB.WithContext(ctx).Model(&IMGroupMember{}).
+		Where("group_id = ? AND uid = ?", groupID, uid).Count(&count).Error
+	return count != 0, err
+}
+
+func insertGroupMembers(tx *gorm.DB, groupID string, uids []uint) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	rows := make([]IMGroupMember, len(uids))
+	for i, uid := range uids {
+		rows[i] = IMGroupMember{GroupID: groupID, UID: uid}
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
+}
+
+// membershipWrite commits a membership change to the DB first and projects it to WuKong
+// inside the same transaction: a WuKong failure rolls the DB back. Once write succeeded,
+// any failure also runs undo, because a failed WuKong call may be partial and a commit
+// failure after the projection leaves WuKong ahead of the DB.
+// ponytail: the transaction spans one WuKong call (5 s timeout) on a single group's rows.
+func membershipWrite(
+	ctx context.Context, write func(*gorm.DB) error,
+	project func(context.Context) error, undo func(context.Context),
+) error {
+	if global.PRISM_DB == nil {
+		return newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "groups are unavailable")
+	}
+	wrote := false
+	var projectErr error
+	err := global.PRISM_DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := write(tx); err != nil {
+			return err
+		}
+		wrote = true
+		projectErr = project(ctx)
+		return projectErr
+	})
+	if err == nil {
+		return nil
+	}
+	if wrote {
+		undo(context.WithoutCancel(ctx))
+	}
+	if projectErr != nil {
+		return newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "group membership service is unavailable")
+	}
+	return newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "group membership could not be updated")
+}
+
+func (p *Plugin) postSubscribers(ctx context.Context, path, groupID string, uids []uint) error {
+	return postWuKongWithAuth(ctx, p.apiAddr, path, p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
+		"channel_id": groupID, "channel_type": groupChannel, "subscribers": uidStrings(uids),
+	}, nil)
+}
+
+// fillGroupMembers is the one-time backfill from WuKong (UNI-IM-DB W1, R9). Only groups
+// with no member rows are pulled, so a filled group is never read from WuKong again and a
+// re-run is a no-op. A Manager 404 (channel wiped) seeds the creator; any other failure
+// leaves the group unfilled for the next boot. The creator is always a member.
+func (p *Plugin) fillGroupMembers(ctx context.Context, db *gorm.DB) {
+	var groups []IMGroup
+	if err := db.WithContext(ctx).Where("NOT EXISTS (SELECT 1 FROM im_group_members " +
+		"WHERE im_group_members.group_id = im_groups.group_id)").Order("id ASC").Find(&groups).Error; err != nil {
+		slog.Warn("im group member fill skipped", "error", err)
+		return
+	}
+	filled, failed := 0, 0
+	for i := range groups {
+		members, err := p.wuKongGroupMembers(ctx, groups[i].GroupID)
+		var upstream *httpStatusError
+		if errors.As(err, &upstream) && upstream.status == http.StatusNotFound {
+			members, err = nil, nil
+		}
+		if err == nil {
+			err = insertGroupMembers(db.WithContext(ctx), groups[i].GroupID, appendUnique(members, groups[i].CreatorUID))
+		}
+		if err != nil {
+			failed++
+			// Upstream errors can contain credentials or response bodies; log the group only.
+			slog.Warn("im group member fill failed", "group_id", groups[i].ID, "channel_id", groups[i].GroupID)
+			continue
+		}
+		filled++
+	}
+	slog.Info("im group member fill", "pending", len(groups), "filled", filled, "failed", failed)
 }
 
 func (p *Plugin) wuKongGroupMembers(ctx context.Context, channelID string) ([]uint, error) {

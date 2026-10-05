@@ -235,6 +235,7 @@ func (p *Plugin) Models() []interface{} {
 		&IMGroup{},
 		&IMGroupAgentAllowlist{},
 		&IMRateWindow{},
+		&IMGroupMember{},
 	}
 }
 
@@ -242,6 +243,12 @@ func (p *Plugin) Start(ctx context.Context) error {
 	if global.PRISM_DB == nil {
 		return errors.New("IM database is not initialized")
 	}
+	// Migrations run before Start and HTTP opens only after it, so no read sees a
+	// half-filled table. Capped at 30 s so an unreachable Manager cannot stall boot;
+	// groups it misses are retried on the next boot.
+	fillCtx, cancelFill := context.WithTimeout(ctx, 30*time.Second)
+	p.fillGroupMembers(fillCtx, global.PRISM_DB)
+	cancelFill()
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.done = make(chan struct{})
 	go p.runWorker(ctx)

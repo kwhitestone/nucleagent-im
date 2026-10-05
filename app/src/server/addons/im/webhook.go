@@ -46,7 +46,7 @@ var (
 	agentMentionTextParser = regexp.MustCompile(`@([A-Za-z0-9_.\-]+)`)
 )
 
-// groupMemberResolver reports the WuKong subscribers of a group channel. Only the
+// groupMemberResolver reports the members of a group channel (im_group_members). Only the
 // agent-sender path needs it, so human triggers keep the M2 database-only cost.
 type groupMemberResolver func(ctx context.Context, channelID string) ([]uint, error)
 
@@ -162,7 +162,7 @@ func (p *Plugin) registerWebhook(api huma.API) {
 			slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})).
 				Debug("im_webhook_debug_body", "event", input.Event, "body", body)
 		}
-		accepted, err := acceptWebhookBatch(ctx, global.PRISM_DB, input.Event, input.Body, time.Now(), p.wuKongGroupMembers)
+		accepted, err := acceptWebhookBatch(ctx, global.PRISM_DB, input.Event, input.Body, time.Now(), groupMembers)
 		if errors.Is(err, errA2ADepthExceeded) {
 			return nil, newWebhookProblem(http.StatusTooManyRequests, "a2a_depth_exceeded",
 				"agent-to-agent chain depth exceeded")

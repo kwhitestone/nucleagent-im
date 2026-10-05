@@ -33,7 +33,7 @@ func m2DB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(
 		&authmodel.User{}, &model.AgentInstance{}, &model.AgentTemplate{},
 		&IMWebhookInbox{}, &IMCoreConversationMap{}, &IMGroup{},
-		&IMGroupAgentAllowlist{}, &IMRateWindow{},
+		&IMGroupAgentAllowlist{}, &IMRateWindow{}, &IMGroupMember{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -513,42 +513,19 @@ func TestParticipantAuthorization(t *testing.T) {
 		t.Fatalf("direct outsider allowed=%v err=%v", allowed, err)
 	}
 
-	wuKong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/channel/messagesync" {
-			http.NotFound(w, r)
-			return
-		}
-		username, password, ok := r.BasicAuth()
-		if !ok || username != "admin" || password != "password" {
-			t.Fatalf("membership request basic auth invalid")
-		}
-		var body struct {
-			LoginUID string `json:"login_uid"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
-		}
-		if body.LoginUID == "3" {
-			w.WriteHeader(http.StatusForbidden)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(wuKongSyncResponse{Messages: []struct {
-			MessageIDStr string `json:"message_idstr"`
-			MessageSeq   uint64 `json:"message_seq"`
-			FromUID      string `json:"from_uid"`
-			Setting      uint8  `json:"setting"`
-			Payload      []byte `json:"payload"`
-		}{}})
-	}))
-	defer wuKong.Close()
-	p.apiAddr = wuKong.URL
-	p.wuKongAdminUser = "admin"
-	p.wuKongAdminPassword = "password"
+	// Group membership answers from im_group_members; there is no WuKong to ask.
+	db := m2DB(t)
+	if err := insertGroupMembers(db, "g1", []uint{1, 2}); err != nil {
+		t.Fatal(err)
+	}
 	if allowed, err := p.channelParticipant(t.Context(), 2, "g1", groupChannel); err != nil || !allowed {
 		t.Fatalf("group allowed=%v err=%v", allowed, err)
 	}
 	if allowed, err := p.channelParticipant(t.Context(), 3, "g1", groupChannel); err != nil || allowed {
 		t.Fatalf("group outsider allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := p.channelParticipant(t.Context(), 2, "g-other", groupChannel); err != nil || allowed {
+		t.Fatalf("member of another group allowed=%v err=%v", allowed, err)
 	}
 }
 

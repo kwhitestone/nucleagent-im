@@ -178,7 +178,7 @@ func (p *Plugin) registerAgentStreams(api huma.API) {
 		}
 		allowed, err := p.channelParticipant(ctx, userID, input.ChannelID, input.ChannelType)
 		if err != nil {
-			return nil, newIMProblem(http.StatusServiceUnavailable, "wukong_unavailable", "channel membership is unavailable")
+			return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "channel membership is unavailable")
 		}
 		if !allowed {
 			return nil, newIMProblem(http.StatusForbidden, "channel_forbidden", "channel membership is required")
@@ -197,24 +197,10 @@ func (p *Plugin) channelParticipant(ctx context.Context, userID uint, channelID 
 		_, _, ok := canonicalPersonChannel(channelID, userID)
 		return ok, nil
 	case groupChannel:
-		return p.wuKongGroupMember(ctx, channelID, userID)
+		return isGroupMember(ctx, channelID, userID)
 	default:
 		return false, nil
 	}
-}
-
-func (p *Plugin) wuKongGroupMember(ctx context.Context, channelID string, userID uint) (bool, error) {
-	var synced wuKongSyncResponse
-	err := postWuKongWithAuth(ctx, p.apiAddr, "/channel/messagesync",
-		p.wuKongAdminUser, p.wuKongAdminPassword, map[string]any{
-			"login_uid":  strconv.FormatUint(uint64(userID), 10),
-			"channel_id": channelID, "channel_type": groupChannel, "limit": 1, "pull_mode": 1,
-		}, &synced)
-	var upstream *httpStatusError
-	if errors.As(err, &upstream) && upstream.status == http.StatusForbidden {
-		return false, nil
-	}
-	return err == nil, err
 }
 
 // agentStreamReplayWindow still delivers a reply or failure that lands just
