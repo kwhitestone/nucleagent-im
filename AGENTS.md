@@ -16,3 +16,5 @@ Before editing, read `/home/workspace/nucleagent-workspace/nucleagent-docs/docs/
 1. Inspect the working tree and staged diff for unrelated changes and credentials.
 2. Run build, vet, and focused tests.
 3. Run the service probes, then inspect the final diff and commit message.
+
+测试性能：遵守工作区根 `/home/workspace/nucleagent-workspace/AGENTS.md` 的《测试性能规则》。
