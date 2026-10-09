@@ -259,6 +259,32 @@ func TestBatchPartialNotFoundAndForeignChannels(t *testing.T) {
 	if convRow(t, db, 2, groupChannel, "g1").Unread != 2 {
 		t.Fatal("foreign read cleared someone's unread")
 	}
+	// The type is part of the identity: a group keyed like a DM is not that DM.
+	seedGroupConv(t, db, "1@5", 1, 2)
+	if r := batch(t, router, 1, "hide", ch("5", personChannel)); r.Results[0].OK || r.Results[0].Code != "not_found" {
+		t.Fatalf("type mismatch=%+v", r)
+	}
+	if convRow(t, db, 1, groupChannel, "1@5").HiddenAt != nil {
+		t.Fatal("a DM request hid a group")
+	}
+}
+
+// A failed UPDATE is reported per channel as error (still 200), and nothing is half-applied.
+func TestBatchUpdateErrorPerChannel(t *testing.T) {
+	db := m2DB(t)
+	router := readsRouter(t)
+	seedDM(t, db, 7, 8, 3)
+	if err := db.Exec(`CREATE TRIGGER fail_uid7 BEFORE UPDATE ON im_conversations WHEN NEW.uid = 7
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	r := batch(t, router, 7, "hide", ch("8", personChannel), ch("9", personChannel))
+	if r.Results[0].OK || r.Results[0].Code != "error" || r.Results[1].Code != "not_found" {
+		t.Fatalf("results=%+v", r)
+	}
+	if row := convRow(t, db, 7, personChannel, "7@8"); row.HiddenAt != nil || row.Unread != 3 {
+		t.Fatalf("row=%+v", row)
+	}
 }
 
 // H7: the state is per viewer and server-side: A hides, B (same DM) still sees it; A's other
