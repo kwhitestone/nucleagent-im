@@ -40,6 +40,7 @@ type Plugin struct {
 	managerTokenExpiry  time.Time
 	webhookAdmission    webhookAdmission
 	backfillDue         atomic.Bool
+	searchFullText      atomic.Bool // the ngram FULLTEXT index is in place (MySQL)
 	cancel              context.CancelFunc
 	done                chan struct{}
 	wg                  sync.WaitGroup
@@ -256,8 +257,12 @@ func (p *Plugin) Start(ctx context.Context) error {
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.done = make(chan struct{})
 	go p.runWorker(ctx)
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go p.runGroupRebuild(ctx)
+	go func() {
+		defer p.wg.Done()
+		p.runSearchMaintenance(ctx, global.PRISM_DB)
+	}()
 	return nil
 }
 
@@ -283,6 +288,7 @@ func (p *Plugin) RegisterRoutes(api huma.API) {
 	p.registerRecipients(api)
 	p.registerAgents(api)
 	p.registerReads(api)
+	p.registerSearch(api)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "imHealth",

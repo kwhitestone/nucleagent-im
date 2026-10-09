@@ -106,7 +106,11 @@ type IMMessage struct {
 	Setting      uint8  `gorm:"not null;default:0"`
 	WKTimestamp  int64  `gorm:"column:wk_timestamp;not null"`
 	WKMessageSeq int64  `gorm:"column:wk_message_seq;not null;default:0"`
-	CreatedAt    time.Time
+	// SearchText is the searchable text (content, file name; IM2-D2), NULL until the backfill
+	// reaches a row saved before it existed. The FULLTEXT index is built at boot (search.go),
+	// not here: it needs the ngram parser, MySQL only, and session settings.
+	SearchText *string `gorm:"type:text"`
+	CreatedAt  time.Time
 }
 
 func (IMMessage) TableName() string { return "im_messages" }

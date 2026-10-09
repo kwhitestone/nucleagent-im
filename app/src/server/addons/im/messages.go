@@ -57,11 +57,12 @@ func persistMessage(tx *gorm.DB, message webhookMessage) (bool, error) {
 		Type int `json:"type"`
 	}
 	_ = json.Unmarshal(message.RawPayload, &head) // non-JSON payloads are kept raw with type 0
+	text := searchText(message.RawPayload)
 	row := IMMessage{
 		MessageIDStr: idStr, ClientMsgNo: message.ClientMsgNo, ChannelKey: key,
 		ChannelType: message.ChannelType, FromUID: sender, PayloadType: head.Type,
 		Payload: string(message.RawPayload), Setting: message.Setting,
-		WKTimestamp: message.Timestamp, WKMessageSeq: message.MessageSeq,
+		WKTimestamp: message.Timestamp, WKMessageSeq: message.MessageSeq, SearchText: &text,
 	}
 	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
 	if result.Error != nil || result.RowsAffected == 0 {
