@@ -305,6 +305,12 @@ func (p *Plugin) removeGroupMember(ctx context.Context, input *groupMemberInput)
 			Delete(&IMGroupMember{}).Error; err != nil {
 			return err
 		}
+		// IM4: an ex-member can no longer open the channel (messagesync needs membership), so
+		// the list row goes too; im_messages stay.
+		if err := tx.Where("uid = ? AND channel_type = ? AND channel_key = ?", memberUID, groupChannel, group.GroupID).
+			Delete(&IMConversation{}).Error; err != nil {
+			return err
+		}
 		return tx.Where("group_id = ? AND (member_uid = ? OR agent_uid = ?)", group.GroupID, memberUID, memberUID).
 			Delete(&IMGroupAgentAllowlist{}).Error
 	}, func(ctx context.Context) error {
@@ -334,6 +340,11 @@ func (p *Plugin) deleteGroup(ctx context.Context, input *groupIDInput) (*emptyOu
 			if err := tx.Where("group_id = ?", group.GroupID).Delete(table).Error; err != nil {
 				return err
 			}
+		}
+		// IM4: every member's list row for the dissolved group; im_messages stay.
+		if err := tx.Where("channel_type = ? AND channel_key = ?", groupChannel, group.GroupID).
+			Delete(&IMConversation{}).Error; err != nil {
+			return err
 		}
 		return tx.Delete(&group).Error
 	}, func(ctx context.Context) error {
