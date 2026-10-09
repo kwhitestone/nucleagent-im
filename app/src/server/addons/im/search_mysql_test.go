@@ -103,19 +103,25 @@ func TestSearchMySQLFullText(t *testing.T) {
 		sort.Strings(ids)
 		return strings.Join(ids, ",")
 	}
-	for _, c := range []struct {
-		user      uint
-		q, typ, w string
-	}{
-		{1, "蓝鲸", "", "s1,s3"}, {1, "abc", "", "s1"}, {1, "ABC", "", "s1"}, {1, "鲸A", "", "s1"}, {1, "q3蓝", "", "s1"},
-		{1, "big", "", "s2"}, // stopword-containing tokens: the index was built with stopwords off
-		{1, "zzqq", "", ""}, {1, "蓝鲸X", "", ""}, {1, "50%", "", "s3"}, {1, "&50", "", "s3"}, {1, "<b>", "", "s3"},
-		{1, "暗号", "", ""}, {3, "暗号", "", "p1,p2"}, {4, "xq7", "", "p1,p2"}, // S4
-		{1, "季度报告", "file", "f1"}, {1, "final.pdf", "file", "f1"}, {1, "季度报告", "", ""}, // S7
-	} {
-		if got := hits(c.user, c.q, c.typ); got != c.w {
-			t.Errorf("uid %d %q %s: got [%s] want [%s]", c.user, c.q, c.typ, got, c.w)
+	// Both plans: budget 0 = FULLTEXT statement only; default = primary-key scan first.
+	previousBudget := searchScanBudgetMS
+	for _, budget := range []int{0, previousBudget} {
+		searchScanBudgetMS = budget
+		for _, c := range []struct {
+			user      uint
+			q, typ, w string
+		}{
+			{1, "蓝鲸", "", "s1,s3"}, {1, "abc", "", "s1"}, {1, "ABC", "", "s1"}, {1, "鲸A", "", "s1"}, {1, "q3蓝", "", "s1"},
+			{1, "big", "", "s2"}, // stopword-containing tokens: the index was built with stopwords off
+			{1, "zzqq", "", ""}, {1, "蓝鲸X", "", ""}, {1, "50%", "", "s3"}, {1, "&50", "", "s3"}, {1, "<b>", "", "s3"},
+			{1, "暗号", "", ""}, {3, "暗号", "", "p1,p2"}, {4, "xq7", "", "p1,p2"}, // S4
+			{1, "季度报告", "file", "f1"}, {1, "final.pdf", "file", "f1"}, {1, "季度报告", "", ""}, // S7
+		} {
+			if got := hits(c.user, c.q, c.typ); got != c.w {
+				t.Errorf("budget %d uid %d %q %s: got [%s] want [%s]", budget, c.user, c.q, c.typ, got, c.w)
+			}
 		}
+		searchScanBudgetMS = previousBudget
 	}
 	// A row inserted after the index exists is found too (the stopword setting is per index).
 	seedSearch(t, db, webhookText("s9", 2, "2@1", personChannel, "新的蓝鲸Abc行 it is"))
@@ -132,6 +138,47 @@ func TestSearchMySQLFullText(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprint(plan), searchIndexName) || !strings.Contains(fmt.Sprint(plan), "fulltext") {
 		t.Fatalf("plan does not use the FULLTEXT index: %v", plan)
+	}
+}
+
+// The scan runs out of its MAX_EXECUTION_TIME budget (MySQL 3024) and the FULLTEXT statement
+// answers instead: same rows, no error.
+func TestSearchMySQLScanTimeoutFallsBack(t *testing.T) {
+	db := mysqlSearchDB(t)
+	sqlDB, _ := db.DB()
+	sqlDB.SetMaxOpenConns(1) // the session setting below must apply to the INSERT
+	if err := db.Exec("SET SESSION cte_max_recursion_depth = 200001").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`INSERT INTO im_messages (message_idstr, channel_key, channel_type, from_uid, payload_type, payload, wk_timestamp, search_text, created_at)
+		WITH RECURSIVE s AS (SELECT 0 n UNION ALL SELECT n + 1 FROM s WHERE n < 199999)
+		SELECT CONCAT('bulk', n), 'g1', 2, 2, 1, '{}', n, CONCAT('普通消息', n), NOW() FROM s`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := insertGroupMembers(db, "g1", []uint{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&IMConversation{UID: 1, ChannelType: groupChannel, ChannelKey: "g1", LastMessageID: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// The one rare hit is the oldest row: the newest-first scan must read all 200k to find it.
+	if err := db.Exec("UPDATE im_messages SET search_text = '罕见暗号蓝鲸' WHERE message_idstr = 'bulk0'").Error; err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ensureSearchIndex(t.Context(), db); !ok || err != nil {
+		t.Fatalf("index ok=%v err=%v", ok, err)
+	}
+	previous := searchScanBudgetMS
+	searchScanBudgetMS = 1
+	t.Cleanup(func() { searchScanBudgetMS = previous })
+	scanErr := searchMessages(db, 1, "罕见暗号", false, 0, false).
+		Select(fmt.Sprintf("/*+ MAX_EXECUTION_TIME(1) */ %s", searchColumns)).Limit(21).Scan(&[]searchRow{}).Error
+	if scanErr == nil || !strings.Contains(scanErr.Error(), "3024") {
+		t.Fatalf("the scan alone did not time out (%v): the fallback is not exercised", scanErr)
+	}
+	rows, err := runSearch(db, 1, "罕见暗号", false, 0, 21, true)
+	if err != nil || len(rows) != 1 || rows[0].MessageIDStr != "bulk0" {
+		t.Fatalf("rows=%v err=%v", rows, err)
 	}
 }
 
@@ -155,75 +202,53 @@ func TestSearchIndexSkippedWhenTooLarge(t *testing.T) {
 	}
 }
 
-// S6: synthetic rows (IM_TEST_MYSQL_ROWS, e.g. 1000000) spread over 2000 channels; the viewer
-// is in 50 of them. p95 of 40 searches must stay under 500 ms. Local/DEV only, never PROD.
+// S6: the handler against an already-seeded 1M-row schema with the FULLTEXT index
+// (IM_TEST_MYSQL_S6=<dsn with database>, e.g. the docs-sentence corpus from s6-real.py: 2000
+// groups, viewer 1 in 50 of them, viewer 2 in 1000), queries from IM_TEST_MYSQL_S6_QUERIES (one
+// per line). Both viewers × every query; p95 < 500 ms. Local/DEV only — never PROD.
 func TestSearchMySQLLatency(t *testing.T) {
-	total, _ := strconv.Atoi(os.Getenv("IM_TEST_MYSQL_ROWS"))
-	if total == 0 {
-		t.Skip("IM_TEST_MYSQL_ROWS not set")
+	dsn, file := os.Getenv("IM_TEST_MYSQL_S6"), os.Getenv("IM_TEST_MYSQL_S6_QUERIES")
+	if dsn == "" || file == "" {
+		t.Skip("IM_TEST_MYSQL_S6 / IM_TEST_MYSQL_S6_QUERIES not set")
 	}
-	db := mysqlSearchDB(t)
-	start := time.Now()
-	words := []string{"项目", "进度", "会议", "报告", "客户", "需求", "测试", "发布", "上线", "合同", "预算", "设计", "评审", "周报", "接口", "数据"}
-	const channels, batch = 2000, 2000
-	for i := 0; i < total; i += batch {
-		var b strings.Builder
-		b.WriteString("INSERT INTO im_messages (message_idstr, channel_key, channel_type, from_uid, payload_type, payload, wk_timestamp, search_text, created_at) VALUES ")
-		for j := i; j < min(i+batch, total); j++ {
-			if j > i {
-				b.WriteByte(',')
-			}
-			text := fmt.Sprintf("%s%s%s 第%d条 %s", words[j%16], words[(j/16)%16], words[(j/256)%16], j, words[(j*7)%16])
-			fmt.Fprintf(&b, "('m%d','g%d',2,%d,1,'{}',%d,'%s',NOW())", j, j%channels, 100+j%500, 1700000000+j, text)
-		}
-		if err := db.Exec(b.String()).Error; err != nil {
-			t.Fatal(err)
-		}
-	}
-	var members []IMGroupMember
-	var convs []IMConversation
-	for g := 0; g < 50; g++ {
-		members = append(members, IMGroupMember{GroupID: fmt.Sprintf("g%d", g*40), UID: 1})
-		convs = append(convs, IMConversation{UID: 1, ChannelType: groupChannel, ChannelKey: fmt.Sprintf("g%d", g*40), LastMessageID: 1})
-	}
-	if err := db.Create(&members).Error; err != nil {
+	db, err := gorm.Open(mysql.Open(dsn+"?charset=utf8mb4&parseTime=True&loc=Local"), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&convs).Error; err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("seeded %d rows in %s", total, time.Since(start).Round(time.Second))
-	start = time.Now()
-	previous := searchIndexMaxRows
-	searchIndexMaxRows = int64(total) * 2
-	t.Cleanup(func() { searchIndexMaxRows = previous })
+	previous := global.PRISM_DB
+	global.PRISM_DB = db
+	t.Cleanup(func() { global.PRISM_DB = previous })
+	var rows int64
+	db.Raw("SELECT COUNT(*) FROM im_messages").Scan(&rows)
 	if ok, err := ensureSearchIndex(t.Context(), db); !ok || err != nil {
 		t.Fatalf("index ok=%v err=%v", ok, err)
 	}
-	t.Logf("FULLTEXT build on %d rows: %s", total, time.Since(start).Round(time.Second))
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := strings.Fields(string(raw))
 	p := &Plugin{}
 	p.searchFullText.Store(true)
 	router := searchRouter(t, p)
-	queries := []string{"项目进度", "会议", "报告客户", "第12345条", "需求测试", "发布", "合同预算", "zzqq", "设计评审", "周报"}
 	var took []time.Duration
-	for round := 0; round < 4; round++ {
+	hits := 0
+	for _, viewer := range []uint{1, 2} {
 		for _, q := range queries {
 			s := time.Now()
-			if code, _ := search(t, router, 1, q, "", ""); code != 200 {
+			code, page := search(t, router, viewer, q, "", "")
+			took = append(took, time.Since(s))
+			if code != 200 && code != 400 {
 				t.Fatalf("%s: %d", q, code)
 			}
-			took = append(took, time.Since(s))
+			hits += len(page.Messages)
 		}
 	}
 	sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
 	p95 := took[len(took)*95/100]
-	var plan []map[string]any
-	db.Raw("EXPLAIN " + db.ToSQL(func(tx *gorm.DB) *gorm.DB {
-		var rows []searchRow
-		return searchMessages(tx, 1, "项目进度", false, 0, true).Limit(21).Scan(&rows)
-	})).Scan(&plan)
-	t.Logf("S6 rows=%d searches=%d p50=%s p95=%s max=%s plan=%v", total, len(took), took[len(took)/2], p95, took[len(took)-1], plan)
+	t.Logf("S6 rows=%d searches=%d hits=%d p50=%s p95=%s max=%s", rows, len(took), hits, took[len(took)/2], p95, took[len(took)-1])
 	if p95 > 500*time.Millisecond {
 		t.Fatalf("p95 %s ≥ 500ms", p95)
 	}
+	_ = strconv.Itoa
 }

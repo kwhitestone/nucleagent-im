@@ -3,6 +3,8 @@ package im
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"html"
 	"log/slog"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/danielgtaylor/huma/v2"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/kwhitestone/prism-fusion/global"
 	"gorm.io/gorm"
 )
@@ -45,6 +48,7 @@ var (
 	searchBackfillBatch                = 500
 	searchBackfillBatchesPerTick       = 20
 	searchMaintenanceInterval          = time.Minute
+	searchScanBudgetMS                 = 300 // 0 = FULLTEXT only (tests); S6: 300 → p95 ~325 ms, max < 550 ms
 )
 
 type SearchInput struct {
@@ -72,6 +76,8 @@ type searchPage struct {
 	Total      int         `json:"total" doc:"first page only; capped at 100"`
 	NextCursor string      `json:"next_cursor"`
 }
+
+const searchColumns = "m.id, m.message_idstr, m.channel_key, m.channel_type, m.from_uid, m.payload_type, m.search_text, m.wk_timestamp, c.hidden_at IS NOT NULL AS hidden"
 
 type searchRow struct {
 	ID           uint64
@@ -127,7 +133,7 @@ func booleanQuery(q string) string {
 // row). Per page, the FULLTEXT path reads the matches and joins on uidx_im_conv.
 func searchMessages(db *gorm.DB, viewer uint, q string, files bool, cursor uint64, fullText bool) *gorm.DB {
 	query := db.Table("im_messages AS m").
-		Select("m.id, m.message_idstr, m.channel_key, m.channel_type, m.from_uid, m.payload_type, m.search_text, m.wk_timestamp, c.hidden_at IS NOT NULL AS hidden").
+		Select(searchColumns).
 		Joins("JOIN im_conversations AS c ON c.uid = ? AND c.channel_type = m.channel_type AND c.channel_key = m.channel_key", viewer).
 		Joins("LEFT JOIN im_group_members AS g ON m.channel_type = ? AND g.group_id = m.channel_key AND g.uid = ?", groupChannel, viewer).
 		Where("m.channel_type = ? OR g.uid IS NOT NULL", personChannel)
@@ -144,6 +150,28 @@ func searchMessages(db *gorm.DB, viewer uint, q string, files bool, cursor uint6
 		query = query.Where("m.id < ?", cursor)
 	}
 	return query.Order("m.id DESC")
+}
+
+// runSearch picks the plan (S6, 1M local rows, docs-sentence corpus, 120 searches): FULLTEXT
+// alone is p95 ~1 s, because a common word (one in four messages) matches 200k+ rows that are
+// all joined and sorted; a newest-first primary-key scan with LIKE stops at the first `limit`
+// hits and is p95 ~150 ms, but crawls for a rare word. So: the scan first under a
+// MAX_EXECUTION_TIME budget, and on timeout (MySQL error 3024) the FULLTEXT statement, which
+// is fast exactly when the word is rare. Through the handler (first page reads 101 rows for
+// the total): FULLTEXT-only p95 1.2 s; scan budget 150 ms p95 200–590 ms; 300 ms p95 320–331
+// ms over 3 runs, max < 550 ms. Without the index: LIKE only.
+func runSearch(db *gorm.DB, viewer uint, q string, files bool, cursor uint64, limit int, fullText bool) ([]searchRow, error) {
+	var rows []searchRow
+	if fullText && searchScanBudgetMS > 0 {
+		scan := searchMessages(db, viewer, q, files, cursor, false)
+		err := scan.Select(fmt.Sprintf("/*+ MAX_EXECUTION_TIME(%d) */ %s", searchScanBudgetMS, searchColumns)).Limit(limit).Scan(&rows).Error
+		var timeout *mysqldriver.MySQLError
+		if !errors.As(err, &timeout) || timeout.Number != 3024 {
+			return rows, err
+		}
+		rows = nil
+	}
+	return rows, searchMessages(db, viewer, q, files, cursor, fullText).Limit(limit).Scan(&rows).Error
 }
 
 // highlight cuts the snippet around the first case-insensitive hit and marks every hit in it.
@@ -216,28 +244,23 @@ func (p *Plugin) registerSearch(api huma.API) {
 			return nil, newIMProblem(http.StatusBadRequest, "invalid_cursor", "cursor is invalid")
 		}
 		viewer := ctx.Value(userIDKey).(uint)
-		db := global.PRISM_DB.WithContext(ctx)
-		files, fullText := input.Type == "file", p.searchFullText.Load()
-		var rows []searchRow
-		if err := searchMessages(db, viewer, q, files, cursor, fullText).Limit(searchPageSize + 1).Scan(&rows).Error; err != nil {
+		// The first page reads up to the total cap in the same statement (total = rows found).
+		limit := searchPageSize + 1
+		if cursor == 0 {
+			limit = searchTotalCap + 1
+		}
+		rows, err := runSearch(global.PRISM_DB.WithContext(ctx), viewer, q, input.Type == "file", cursor, limit, p.searchFullText.Load())
+		if err != nil {
 			slog.Warn("im search failed", "error", err)
 			return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "search is unavailable")
 		}
 		page := searchPage{Messages: make([]searchHit, 0, searchPageSize)}
+		if cursor == 0 {
+			page.Total = min(len(rows), searchTotalCap)
+		}
 		if len(rows) > searchPageSize {
 			rows = rows[:searchPageSize]
 			page.NextCursor = strconv.FormatUint(rows[len(rows)-1].ID, 10)
-		}
-		if cursor == 0 {
-			page.Total = len(rows)
-			if page.NextCursor != "" {
-				var total int64
-				if err := db.Table("(?) AS x", searchMessages(db, viewer, q, files, 0, fullText).Select("m.id").Limit(searchTotalCap)).
-					Count(&total).Error; err != nil {
-					return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "search is unavailable")
-				}
-				page.Total = int(total)
-			}
 		}
 		for _, r := range rows {
 			snippet, marked, ranges := highlight(r.SearchText, q)
