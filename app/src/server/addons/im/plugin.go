@@ -118,6 +118,7 @@ type ConversationListInput struct {
 	Body struct {
 		Cursor string `json:"cursor,omitempty"`
 		Limit  int    `json:"limit,omitempty"`
+		Hidden bool   `json:"hidden,omitempty" doc:"true = only the caller's hidden conversations"`
 	}
 }
 
