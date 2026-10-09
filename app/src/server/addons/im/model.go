@@ -121,7 +121,10 @@ type IMConversation struct {
 	ChannelKey    string `gorm:"size:191;not null;uniqueIndex:uidx_im_conv,priority:3"`
 	LastMessageID uint64 `gorm:"not null;index:idx_im_conv_recent,priority:2"`
 	Unread        int    `gorm:"not null;default:0"`
-	UpdatedAt     time.Time
+	// HiddenAt is set when the viewer hides the row (Q3 §2); a message from anyone else
+	// clears it. NULL = visible. Additive column, AutoMigrate adds it.
+	HiddenAt  *time.Time
+	UpdatedAt time.Time
 }
 
 func (IMConversation) TableName() string { return "im_conversations" }

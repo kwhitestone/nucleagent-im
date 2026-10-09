@@ -91,11 +91,13 @@ func persistMessage(tx *gorm.DB, message webhookMessage) (bool, error) {
 	// included (WK's red_dot:0 on API sends is ignored). The CASE keeps the newest id when
 	// concurrent batches commit out of order; it is portable where GREATEST is not. A message
 	// older than the current last one (a W4 backfill gets a fresh, higher id) never becomes
-	// the preview.
+	// the preview. A message from someone else also unhides the row (Q3 §2: hidden rows come
+	// back on new messages); the viewer's own message from another device does not.
 	return true, tx.Model(&IMConversation{}).
 		Where("channel_type = ? AND channel_key = ? AND uid IN ?", message.ChannelType, key, viewers).
 		Updates(map[string]any{
-			"unread": gorm.Expr("unread + CASE WHEN uid = ? THEN 0 ELSE 1 END", sender),
+			"unread":    gorm.Expr("unread + CASE WHEN uid = ? THEN 0 ELSE 1 END", sender),
+			"hidden_at": gorm.Expr("CASE WHEN uid = ? THEN hidden_at ELSE NULL END", sender),
 			"last_message_id": gorm.Expr("CASE WHEN last_message_id < ? AND COALESCE((SELECT wk_timestamp FROM im_messages WHERE id = last_message_id), 0) <= ? THEN ? ELSE last_message_id END",
 				row.ID, row.WKTimestamp, row.ID),
 		}).Error

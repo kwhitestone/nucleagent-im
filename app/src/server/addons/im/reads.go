@@ -174,8 +174,17 @@ func channelMessages(db *gorm.DB, channelType uint8, key string, start, end uint
 
 // conversationList is one keyset page on idx_im_conv_recent: last_message_id < cursor, newest first.
 // last_message_id is unique per viewer (a message lives in one channel), so pages never overlap.
-func conversationList(db *gorm.DB, viewer uint, cursor uint64, limit int) (conversationPage, error) {
+// hidden picks the hidden view (Q3 §2) instead of the default visible one.
+// ponytail: the hidden_at filter runs on rows already found by idx_im_conv_recent, so a page
+// reads past the viewer's hidden rows. Add index (uid, hidden_at, last_message_id) once one
+// viewer has >1k hidden rows (EXPLAIN rows/limit ≫ 1 on this query); not needed before.
+func conversationList(db *gorm.DB, viewer uint, cursor uint64, limit int, hidden bool) (conversationPage, error) {
 	query := db.Where("uid = ?", viewer).Order("last_message_id DESC").Limit(limit + 1)
+	if hidden {
+		query = query.Where("hidden_at IS NOT NULL")
+	} else {
+		query = query.Where("hidden_at IS NULL")
+	}
 	if cursor != 0 {
 		query = query.Where("last_message_id < ?", cursor)
 	}
@@ -215,6 +224,101 @@ func conversationList(db *gorm.DB, viewer uint, cursor uint64, limit int) (conve
 	return page, nil
 }
 
+const batchMax = 100
+
+type batchChannel struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+}
+
+type ConversationBatchInput struct {
+	Body struct {
+		Action   string         `json:"action,omitempty" doc:"hide | unhide | read"`
+		Channels []batchChannel `json:"channels,omitempty" doc:"1–100 channels"`
+	}
+}
+
+type batchResult struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	OK          bool   `json:"ok"`
+	Code        string `json:"code"` // "" | not_found | error
+}
+
+var batchUpdates = map[string]func(now time.Time) map[string]any{
+	"hide":   func(now time.Time) map[string]any { return map[string]any{"hidden_at": now, "unread": 0} },
+	"unhide": func(time.Time) map[string]any { return map[string]any{"hidden_at": nil} },
+	"read":   func(time.Time) map[string]any { return map[string]any{"unread": 0} },
+}
+
+// ownChannelKey maps a client channel to the stored key without a membership lookup: the
+// batch only touches the caller's own im_conversations rows, so "no row for uid=viewer" is
+// the authorization (not_found), and a foreign DM key never canonicalizes for the viewer.
+func ownChannelKey(c batchChannel, viewer uint) (string, bool) {
+	id := strings.TrimSpace(c.ChannelID)
+	switch c.ChannelType {
+	case personChannel:
+		if !strings.Contains(id, "@") {
+			id = strconv.FormatUint(uint64(viewer), 10) + "@" + id
+		}
+		key, _, ok := canonicalPersonChannel(id, viewer)
+		return key, ok
+	case groupChannel:
+		return id, id != ""
+	}
+	return "", false
+}
+
+// conversationBatch applies action to the caller's rows (Q3 §2): one SELECT, one UPDATE.
+// Every action is idempotent; channels without a row of the caller's are not_found.
+func conversationBatch(db *gorm.DB, viewer uint, action string, channels []batchChannel) ([]batchResult, error) {
+	type ref struct {
+		typ uint8
+		key string
+	}
+	refs := make([]ref, len(channels))
+	wanted := map[ref]bool{}
+	var keys []string
+	for i, c := range channels {
+		if key, ok := ownChannelKey(c, viewer); ok {
+			refs[i] = ref{c.ChannelType, key}
+			wanted[refs[i]] = true
+			keys = append(keys, key)
+		}
+	}
+	var rows []IMConversation
+	if len(keys) > 0 {
+		if err := db.Select("id, channel_type, channel_key").
+			Where("uid = ? AND channel_key IN ?", viewer, keys).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+	}
+	found := make(map[ref]uint64, len(rows))
+	ids := make([]uint64, 0, len(rows))
+	for _, r := range rows {
+		if k := (ref{r.ChannelType, r.ChannelKey}); wanted[k] {
+			found[k] = r.ID
+			ids = append(ids, r.ID)
+		}
+	}
+	code := ""
+	if len(ids) > 0 {
+		if err := db.Model(&IMConversation{}).Where("uid = ? AND id IN ?", viewer, ids).
+			Updates(batchUpdates[action](time.Now())).Error; err != nil {
+			slog.Warn("im conversation batch update failed", "uid", viewer, "action", action, "error", err)
+			code = "error"
+		}
+	}
+	results := make([]batchResult, len(channels))
+	for i, c := range channels {
+		results[i] = batchResult{ChannelID: c.ChannelID, ChannelType: c.ChannelType, Code: "not_found"}
+		if _, ok := found[refs[i]]; ok {
+			results[i].Code, results[i].OK = code, code == ""
+		}
+	}
+	return results, nil
+}
+
 func (p *Plugin) registerReads(api huma.API) {
 	security := []map[string][]string{{"AuthTokenAuth": {}}}
 	unavailable := func() error {
@@ -230,11 +334,34 @@ func (p *Plugin) registerReads(api huma.API) {
 			return nil, newIMProblem(http.StatusBadRequest, "invalid_cursor", "cursor is invalid")
 		}
 		viewer := ctx.Value(userIDKey).(uint)
-		page, err := conversationList(global.PRISM_DB.WithContext(ctx), viewer, cursor, clampLimit(input.Body.Limit, conversationPageDefault))
+		page, err := conversationList(global.PRISM_DB.WithContext(ctx), viewer, cursor, clampLimit(input.Body.Limit, conversationPageDefault), input.Body.Hidden)
 		if err != nil {
 			return nil, unavailable()
 		}
 		return &ProxyOutput{Body: page}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "imConversationBatch", Method: http.MethodPost, Path: "/api/v1/im/conversation/batch",
+		Summary: "Hide, unhide or mark read 1–100 of the caller's conversations", Tags: []string{"IM"}, Security: security,
+	}, func(ctx context.Context, input *ConversationBatchInput) (*ProxyOutput, error) {
+		n := len(input.Body.Channels)
+		if batchUpdates[input.Body.Action] == nil || n < 1 || n > batchMax {
+			return nil, newIMProblem(http.StatusBadRequest, "invalid_request", "action must be hide, unhide or read with 1–100 channels")
+		}
+		viewer := ctx.Value(userIDKey).(uint)
+		results, err := conversationBatch(global.PRISM_DB.WithContext(ctx), viewer, input.Body.Action, input.Body.Channels)
+		if err != nil {
+			return nil, unavailable()
+		}
+		ok := 0
+		for _, r := range results {
+			if r.OK {
+				ok++
+			}
+		}
+		slog.Info("im conversation batch", "uid", viewer, "action", input.Body.Action, "n", n, "ok", ok)
+		return &ProxyOutput{Body: map[string]any{"results": results}}, nil
 	})
 
 	huma.Register(api, huma.Operation{
