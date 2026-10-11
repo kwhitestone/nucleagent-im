@@ -3,13 +3,14 @@ set -euo pipefail
 umask 077
 root="$(cd "$(dirname "$0")" && pwd)"
 workspace=/home/workspace/nucleagent-workspace
-localdir="$root/.validation"
+shared_revision="$(node -e 'const fs=require("fs"); const lock=JSON.parse(fs.readFileSync(process.argv[1])); const pin=lock.dependencies.find(d=>d.name==="nucleagent-shared")?.commit; if (!/^[0-9a-f]{40}$/.test(pin??"")) process.exit(1); process.stdout.write(pin)' "$root/workspace.lock.json")"
+localdir="$root/.validation/shared-$shared_revision"
 mkdir -p "$localdir"
 cd "$root/app/src/server"
 if [[ ! -f "$localdir/ready-tombstone" ]]; then
   for spec in \
     "prism-fusion a32f03b296121ef3fc7f9d257ab3a0935f2008b6" \
-    "nucleagent-shared 1c780d3894518c0b2608dce2838c3c6b6ecd90ea" \
+    "nucleagent-shared $shared_revision" \
     "nucleagent-storage 18d943b20005b7a351f96e8175e9c3e5ab2079b6" \
     "nucleagent-storage-ndcs 0ff0b4733f13c12d175fbfe8c2ce1a2752d0002c"; do
     read -r name revision <<< "$spec"

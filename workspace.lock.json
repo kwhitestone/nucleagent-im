@@ -12,6 +12,18 @@
           "path": "src/server"
         }
       ]
+    },
+    {
+      "name": "nucleagent-shared",
+      "repository": "kwhitestone/nucleagent-shared",
+      "commit": "ba965e60243aa5c208f90a35f15dd3ab295d434e",
+      "role": "runtime",
+      "goModules": [
+        {
+          "module": "github.com/nucleagent/nucleagent-shared",
+          "path": "."
+        }
+      ]
     }
   ]
 }
