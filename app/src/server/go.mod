@@ -6,7 +6,10 @@ require (
 	github.com/danielgtaylor/huma/v2 v2.34.1
 	github.com/gin-gonic/gin v1.11.0
 	github.com/kwhitestone/prism-fusion v0.0.0
+	github.com/nucleagent/nucleagent-shared v0.0.0
 )
+
+require github.com/kwhitestone/nucleagent-storage v0.0.0 // indirect
 
 require (
 	filippo.io/edwards25519 v1.1.1 // indirect
@@ -70,7 +73,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 	gorm.io/driver/sqlite v1.6.0 // indirect
-	gorm.io/gorm v1.31.1 // indirect
+	gorm.io/gorm v1.31.1
 	modernc.org/libc v1.67.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
