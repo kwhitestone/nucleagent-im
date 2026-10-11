@@ -55,4 +55,15 @@ func TestAgentDirectory(t *testing.T) {
 	if strings.Contains(response.Body.String(), "SECRET-PERSONA") {
 		t.Fatal("persona prompt leaked")
 	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("directory can be served from a stale cache")
+	}
+	if err := db.Model(&model.AgentTemplate{}).Where("auth_agent_user_id = ?", 50).
+		Update("is_active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	response = authorizedRequest(t, router, http.MethodGet, "/api/v1/im/agents", issueSessionToken(t, db, 1, "agents-session-next"))
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || len(body.Data) != 0 {
+		t.Fatal("directory retained disabled definition")
+	}
 }

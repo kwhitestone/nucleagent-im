@@ -13,4 +13,5 @@ log/
 .idea/
 *.swp
 .DS_Store
+.validation/
 Thumbs.db
