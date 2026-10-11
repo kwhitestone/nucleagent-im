@@ -25,6 +25,9 @@ type coreMessage struct {
 }
 
 func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) error {
+	if err := p.checkDelivery(ctx, row); err != nil {
+		return err
+	}
 	token, err := p.serviceToken()
 	if err != nil {
 		return err
@@ -92,6 +95,9 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		}
 		switch {
 		case message.MsgType == "streaming":
+			if err := p.checkDelivery(ctx, row); err != nil {
+				return false, err
+			}
 			if err := persistSnapshot(row, message.Content); err != nil {
 				return false, err
 			}
@@ -176,7 +182,7 @@ func (p *Plugin) registerAgentStreams(api huma.API) {
 		if userID == 0 || strings.TrimSpace(input.ChannelID) == "" {
 			return nil, newIMProblem(http.StatusBadRequest, "invalid_channel", "invalid channel")
 		}
-		allowed, err := p.channelParticipant(ctx, userID, input.ChannelID, input.ChannelType)
+		allowed, err := p.streamViewerAllowed(ctx, userID, input.ChannelID, input.ChannelType)
 		if err != nil {
 			return nil, newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "channel membership is unavailable")
 		}
@@ -186,7 +192,8 @@ func (p *Plugin) registerAgentStreams(api huma.API) {
 		channelID := input.ChannelID
 		channelType := input.ChannelType
 		return &huma.StreamResponse{Body: func(hctx huma.Context) {
-			p.serveAgentStream(hctx, channelID, channelType)
+			// Huma's streaming context need not retain the handler context values.
+			p.serveAgentStreamForUser(hctx, channelID, channelType, userID)
 		}}, nil
 	})
 }
@@ -207,9 +214,9 @@ func (p *Plugin) channelParticipant(ctx context.Context, userID uint, channelID 
 // before the chat opens or across a stream reconnect.
 const agentStreamReplayWindow = 2 * time.Minute
 
-func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelType uint8) {
+func (p *Plugin) serveAgentStreamForUser(hctx huma.Context, channelID string, channelType uint8, userID uint) {
 	hctx.SetHeader("Content-Type", "text/event-stream")
-	hctx.SetHeader("Cache-Control", "no-cache")
+	hctx.SetHeader("Cache-Control", "no-store")
 	hctx.SetHeader("Connection", "keep-alive")
 	hctx.SetHeader("X-Accel-Buffering", "no")
 	writer := hctx.BodyWriter()
@@ -227,46 +234,7 @@ func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelTy
 	defer ticker.Stop()
 	defer heartbeat.Stop()
 	send := func() bool {
-		var rows []IMWebhookInbox
-		if err := global.PRISM_DB.Where("channel_id = ? AND channel_type = ?", channelID, channelType).
-			Where("state = ? OR (state IN ? AND updated_at >= ?)",
-				inboxProcessing, []string{inboxCompleted, inboxDead}, finishedSince).
-			Order("id DESC").Limit(100).Find(&rows).Error; err != nil {
-			return false
-		}
-		for i := len(rows) - 1; i >= 0; i-- {
-			signature := fmt.Sprintf("%s:%d:%s", rows[i].State, rows[i].Revision, rows[i].FinalWuKongClientMsgNo)
-			if seen[rows[i].ID] == signature {
-				continue
-			}
-			if _, ok := seen[rows[i].ID]; !ok {
-				writeAgentEvent(writer, flusher, rows[i], "open", map[string]any{
-					"sourceKey": rows[i].SourceKey, "agentUid": rows[i].TargetAgentUID,
-					"channel": map[string]any{"id": rows[i].ChannelID, "type": rows[i].ChannelType},
-				})
-			}
-			switch rows[i].State {
-			case inboxProcessing:
-				if rows[i].Revision != 0 {
-					writeAgentEvent(writer, flusher, rows[i], "snapshot", map[string]any{
-						"sourceKey": rows[i].SourceKey, "text": rows[i].CumulativeAnswer,
-						"revision": rows[i].Revision,
-					})
-				}
-			case inboxCompleted:
-				writeAgentEvent(writer, flusher, rows[i], "complete", map[string]any{
-					"sourceKey": rows[i].SourceKey, "text": rows[i].CumulativeAnswer,
-					"revision": rows[i].Revision, "clientMsgNo": rows[i].FinalWuKongClientMsgNo,
-				})
-			case inboxDead:
-				writeAgentEvent(writer, flusher, rows[i], "error", map[string]any{
-					"sourceKey": rows[i].SourceKey, "code": rows[i].LastErrorCode,
-					"message": "The agent could not complete this request.",
-				})
-			}
-			seen[rows[i].ID] = signature
-		}
-		return true
+		return p.sendAgentSnapshots(ctx, writer, flusher, userID, channelID, channelType, finishedSince, seen)
 	}
 	if !send() {
 		return
@@ -286,6 +254,75 @@ func (p *Plugin) serveAgentStream(hctx huma.Context, channelID string, channelTy
 			}
 		}
 	}
+}
+
+func (p *Plugin) sendAgentSnapshots(ctx context.Context, writer io.Writer, flusher http.Flusher,
+	userID uint, channelID string, channelType uint8, finishedSince time.Time, seen map[uint]string) bool {
+	allowed, err := p.streamViewerAllowed(ctx, userID, channelID, channelType)
+	if err != nil || !allowed {
+		return false
+	}
+	var rows []IMWebhookInbox
+	if err := global.PRISM_DB.WithContext(ctx).Where("channel_id = ? AND channel_type = ?", channelID, channelType).
+		Where("state = ? OR (state IN ? AND updated_at >= ?)",
+			inboxProcessing, []string{inboxCompleted, inboxDead}, finishedSince).
+		Order("id DESC").Limit(100).Find(&rows).Error; err != nil {
+		return false
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		signature := fmt.Sprintf("%s:%d:%s", rows[i].State, rows[i].Revision, rows[i].FinalWuKongClientMsgNo)
+		if seen[rows[i].ID] == signature {
+			continue
+		}
+		// Terminal notifications are not agent content and must never replay the
+		// saved answer or an arbitrary upstream error string.
+		if rows[i].State == inboxDead {
+			allowed, err := p.streamViewerAllowed(ctx, userID, channelID, channelType)
+			if err != nil || !allowed {
+				return false
+			}
+			writeAgentEvent(writer, flusher, rows[i], "error", map[string]any{
+				"sourceKey": rows[i].SourceKey, "code": "im_execution_failed",
+				"message": "The agent could not complete this request.",
+			})
+			seen[rows[i].ID] = signature
+			continue
+		}
+		if err := p.checkDelivery(ctx, &rows[i]); err != nil {
+			var denied *httpStatusError
+			if errors.As(err, &denied) && denied.status >= 400 && denied.status < 500 &&
+				denied.status != http.StatusTooManyRequests {
+				continue
+			}
+			return false
+		}
+		allowed, err := p.streamViewerAllowed(ctx, userID, channelID, channelType)
+		if err != nil || !allowed {
+			return false
+		}
+		if _, ok := seen[rows[i].ID]; !ok {
+			writeAgentEvent(writer, flusher, rows[i], "open", map[string]any{
+				"sourceKey": rows[i].SourceKey, "agentUid": rows[i].TargetAgentUID,
+				"channel": map[string]any{"id": rows[i].ChannelID, "type": rows[i].ChannelType},
+			})
+		}
+		switch rows[i].State {
+		case inboxProcessing:
+			if rows[i].Revision != 0 {
+				writeAgentEvent(writer, flusher, rows[i], "snapshot", map[string]any{
+					"sourceKey": rows[i].SourceKey, "text": rows[i].CumulativeAnswer,
+					"revision": rows[i].Revision,
+				})
+			}
+		case inboxCompleted:
+			writeAgentEvent(writer, flusher, rows[i], "complete", map[string]any{
+				"sourceKey": rows[i].SourceKey, "text": rows[i].CumulativeAnswer,
+				"revision": rows[i].Revision, "clientMsgNo": rows[i].FinalWuKongClientMsgNo,
+			})
+		}
+		seen[rows[i].ID] = signature
+	}
+	return true
 }
 
 func writeAgentEvent(writer io.Writer, flusher http.Flusher, row IMWebhookInbox, event string, data any) {

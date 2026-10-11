@@ -315,8 +315,10 @@ func TestA2AAgentHopUsesOriginHumanAuthorization(t *testing.T) {
 
 func TestDispatchCarriesProvenanceToCore(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	addUser(t, db, 43, authmodel.AccountTypeAgent)
+	lifecycleGroup(t, db, 1, 42, 43)
 	row := &IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "carry", TargetAgentUID: 43, SenderUID: 42,
 		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,
@@ -328,6 +330,9 @@ func TestDispatchCarriesProvenanceToCore(t *testing.T) {
 	}
 	var got *a2aProvenance
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		var input dispatchRequest
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Error(err)
@@ -335,6 +340,9 @@ func TestDispatchCarriesProvenanceToCore(t *testing.T) {
 			return
 		}
 		got = input.Provenance
+		if !input.AdmittedAt.Equal(row.CreatedAt) {
+			t.Error("dispatch lost immutable admission time")
+		}
 		_ = json.NewEncoder(w).Encode(dispatchResult{
 			ConversationID: 9, SourceKey: input.SourceKey, Status: "accepted",
 		})
@@ -355,6 +363,7 @@ func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
+	lifecycleGroup(t, db, 1, 42)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "stamp", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "g1", ChannelType: groupChannel, Text: "hello", State: inboxProcessing,
@@ -366,6 +375,9 @@ func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 	}
 	var sent []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		var body struct {
 			Payload string `json:"payload"`
 		}
@@ -384,7 +396,7 @@ func TestSendFinalStampsProvenanceReadableByTheNextHop(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	if err := (&Plugin{apiAddr: server.URL}).sendFinal(t.Context(), &row, 7, "转给 @user-43"); err != nil {
+	if err := (&Plugin{apiAddr: server.URL, coreURL: server.URL, serviceJWT: "test-token"}).sendFinal(t.Context(), &row, 7, "转给 @user-43"); err != nil {
 		t.Fatal(err)
 	}
 

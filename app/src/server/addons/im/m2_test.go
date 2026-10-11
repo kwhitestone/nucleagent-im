@@ -377,6 +377,9 @@ func TestCoreStreamResumeSnapshotsFinalAndIdempotency(t *testing.T) {
 	}))
 	defer wuKong.Close()
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		if got := r.Header.Get("Last-Event-ID"); got != "7" {
 			t.Fatalf("Last-Event-ID=%q", got)
 		}
@@ -440,6 +443,9 @@ func TestCoreStreamRetriesFinalEventAfterWuKongFailure(t *testing.T) {
 	}))
 	defer wuKong.Close()
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		if got := r.Header.Get("Last-Event-ID"); got != "7" {
 			t.Fatalf("Last-Event-ID=%q, want 7", got)
 		}
@@ -473,6 +479,8 @@ func TestCoreStreamRetriesFinalEventAfterWuKongFailure(t *testing.T) {
 
 func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
 	db := m2DB(t)
+	addUser(t, db, 1, authmodel.AccountTypeHuman)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	row := IMWebhookInbox{
 		Event: "msg.notify", MessageIDStr: "error", TargetAgentUID: 42, SenderUID: 1,
 		ChannelID: "1@42", ChannelType: personChannel, Text: "hello", State: inboxProcessing,
@@ -489,6 +497,9 @@ func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
 	}))
 	defer wuKong.Close()
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "id: 11\nevent: message-created\ndata: {\"id\":11,\"senderType\":\"system\",\"msgType\":\"error\",\"content\":\"secret failure\"}\n\n")
 	}))
@@ -601,6 +612,9 @@ func TestFinalWuKongPayloadIsBase64Text(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		var body struct {
 			Payload string `json:"payload"`
 		}
@@ -614,7 +628,7 @@ func TestFinalWuKongPayloadIsBase64Text(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	if err := (&Plugin{apiAddr: server.URL}).sendFinal(context.Background(), &row, 7, "answer"); err != nil {
+	if err := (&Plugin{apiAddr: server.URL, coreURL: server.URL, serviceJWT: "test-token"}).sendFinal(context.Background(), &row, 7, "answer"); err != nil {
 		t.Fatal(err)
 	}
 }

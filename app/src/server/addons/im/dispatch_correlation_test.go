@@ -17,11 +17,15 @@ func TestDispatchTwoTurnsAndReconnect(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
+	lifecycleGroup(t, db, 1, 42)
 	var mu sync.Mutex
 	var answers, cursors []string
 	dispatches := map[string]bool{}
 	disconnected := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		switch r.URL.Path {
@@ -136,7 +140,11 @@ func TestDispatchBusyRemainsTerminalDomainError(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
+	lifecycleGroup(t, db, 1, 42)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprint(w, `{"code":"im_conversation_busy"}`)
 	}))

@@ -32,6 +32,45 @@ No definition copies, admin credentials or new privileged admin routes.
 Directory invalidation uses fresh authoritative reads and Cache-Control: no-store;
 there is no server directory cache to invalidate. Frontend polling is not IM-owned.
 
+## Public directory contract (frontend follow-up)
+
+GET /api/v1/im/agents keeps the existing {code,message,data:[...]} envelope.
+Each item: {uid,name,description,avatar,revision,effectiveSource:"definition",
+modelRule:"im-next-admission",promptRule:"next-admission",
+overrideRule:"instance-explicit",inFlightRule:"pinned"}.
+Avatar is empty when absent. revision is an opaque public-projection fingerprint,
+not a definition CAS token, monotonic event ID, or Core effective revision.
+The header X-IM-Directory-Revision fingerprints the complete directory.
+effectiveSource describes this directory's source, NOT an individual user's
+runtime selection; explicit overrides still require the authorized Core view.
+No prompt, model credentials, private overrides or unknown config are returned.
+
+GET /api/v1/im/agents/events?after=<directory-revision>
+returns {code:0,message:"success",data:{revision:"...",changed:true|false}}.
+An omitted/unknown cursor means changed=true; an equal cursor means false.
+Both endpoints require an enabled authenticated user, not admin permissions,
+and use Cache-Control: no-store. Poll at most once per 2s while visible, then
+reread the directory on changed=true. Focus/reconnect also rereads. Clients may
+get the initial cursor from events if the proxy does not expose the header.
+This is current-state invalidation, NOT the privileged durable admin event feed.
+It covers public fields, definition update time and directory membership; it
+does not claim to fingerprint shared skill/tool changes or per-instance config.
+Execution safety never depends on observing an invalidation notification.
+
+## Integration and rollout
+
+Core lifecycle and im-dispatch support must ship with IM, and Core must have
+migrated agent_templates.deleted_at. The validation snapshot uses the approved
+Shared 1c780d3 tombstone model; production dependency pins remain parent-owned.
+Undeployed/denied lifecycle endpoints fail closed (4xx makes pending work terminal).
+503/429/transport/malformed responses prevent delivery and remain retryable.
+Restored definitions may serve new inbox admissions, never pre-barrier work.
+Generic terminal error notifications contain no saved answer/upstream error
+string and are still gated by current viewer account/channel membership.
+No claim of atomicity across a Core check and an external WuKong HTTP send:
+already-sent bytes cannot be recalled. Core owns cancellation and its admission
+transaction; IM checks immediately before each delivery boundary.
+
 ## Boundaries
 
 Read workspace AGENTS, repo AGENTS, docs/nucleagent/09-workspace-frontend-maintenance.md,

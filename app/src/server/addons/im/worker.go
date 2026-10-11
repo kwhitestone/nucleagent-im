@@ -45,6 +45,7 @@ type dispatchRequest struct {
 	Input                string          `json:"input"`
 	InitialHistory       []historyTurn   `json:"initialHistory"`
 	Provenance           *a2aProvenance  `json:"provenance,omitempty"`
+	AdmittedAt           time.Time       `json:"admittedAt"`
 }
 
 type dispatchChannel struct {
@@ -213,7 +214,7 @@ func (p *Plugin) serviceToken() (string, error) {
 }
 
 func (p *Plugin) dispatchCore(ctx context.Context, row *IMWebhookInbox, history []historyTurn) (*dispatchResult, error) {
-	if err := checkDispatchParticipants(ctx, row); err != nil {
+	if err := p.checkDelivery(ctx, row); err != nil {
 		return nil, err
 	}
 	token, err := p.serviceToken()
@@ -224,6 +225,7 @@ func (p *Plugin) dispatchCore(ctx context.Context, row *IMWebhookInbox, history 
 		SourceKey: row.SourceKey, ExecutionOwnerUserID: row.ExecutionOwnerUserID,
 		AgentUID: row.TargetAgentUID, Channel: dispatchChannel{ID: row.ChannelID, Type: int(row.ChannelType)},
 		Input: row.Text, InitialHistory: history,
+		AdmittedAt: row.CreatedAt.UTC(),
 		Provenance: &a2aProvenance{
 			ChainID: row.ChainID, Depth: row.ChainDepth,
 			OriginUID: row.OriginSenderUID, ViaUID: row.SourceAgentUID,
@@ -378,7 +380,7 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 	if current.State == inboxCompleted && current.FinalSentAt != nil {
 		return nil
 	}
-	if err := checkDispatchParticipants(ctx, row); err != nil {
+	if err := p.checkDelivery(ctx, row); err != nil {
 		return err
 	}
 	if row.FinalWuKongClientMsgNo == "" {
