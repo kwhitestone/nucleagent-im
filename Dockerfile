@@ -2,11 +2,10 @@
 # =============================================================================
 # nucleagent-im image.
 #
-# Build context must be the workspace root because go.mod replace directives
-# point to prism-fusion, nucleagent-shared, nucleagent-storage-ndcs and
-# nucleagent-storage/app/src/server:
+# Build context is this repository; pinned sibling packages live in build/deps
+# (see build/README.md). Same mechanism as nucleagent-core/nucleagent-auth.
 #
-#   docker build -t nucleagent-im -f nucleagent-im/Dockerfile .
+#   docker build -t nucleagent-im .
 # =============================================================================
 
 FROM golang:1.26 AS go-build
@@ -17,11 +16,8 @@ WORKDIR /build
 # initialize/gorm.go, utils/rotatelogs.go and the auth addon import it, and the
 # shared auth plugin is now in im's build graph. ndcs in turn imports
 # nucleagent-storage/contracts/provider, so storage has to be staged too.
-COPY nucleagent-im/app/src/server/      ./nucleagent-im/app/src/server/
-COPY prism-fusion/src/server/           ./prism-fusion/src/server/
-COPY nucleagent-shared/                 ./nucleagent-shared/
-COPY nucleagent-storage-ndcs/           ./nucleagent-storage-ndcs/
-COPY nucleagent-storage/app/src/server/ ./nucleagent-storage/app/src/server/
+COPY app/src/server/ ./nucleagent-im/app/src/server/
+COPY build/deps/     ./
 
 WORKDIR /build/nucleagent-im/app/src/server
 RUN go build -ldflags="-s -w" -o /out/nucleagent-im .
@@ -34,7 +30,7 @@ RUN apk add --no-cache ca-certificates tzdata wget && \
 RUN mkdir -p /opt/log && chown -R im:im /opt
 
 COPY --from=go-build /out/nucleagent-im /usr/local/bin/nucleagent-im
-COPY nucleagent-im/app/src/server/config.yaml /opt/config.yaml
+COPY --chmod=0644 app/src/server/config.yaml /opt/config.yaml
 
 WORKDIR /opt
 USER im
