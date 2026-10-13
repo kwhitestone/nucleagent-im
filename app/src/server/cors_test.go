@@ -36,6 +36,10 @@ func TestSSEReconnectCORS(t *testing.T) {
 			rec.Header().Get("Access-Control-Allow-Credentials") != "true" {
 			t.Fatalf("%s: status=%d headers=%v", method, rec.Code, rec.Header())
 		}
+		// im-web is cross-origin and reads the directory revision header (agents.ts).
+		if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "X-IM-Directory-Revision") {
+			t.Errorf("%s: CORS does not expose X-IM-Directory-Revision", method)
+		}
 		allowed := "," + strings.ToLower(strings.ReplaceAll(rec.Header().Get("Access-Control-Allow-Headers"), " ", "")) + ","
 		for _, header := range []string{"authorization", "content-type", "last-event-id"} {
 			if !strings.Contains(allowed, ","+header+",") {

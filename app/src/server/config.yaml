@@ -8,7 +8,7 @@ cors:
     - allow-origin: '${IM_WEB_FRONTEND_URL}'
       allow-headers: 'Content-Type,AccessToken,X-CSRF-Token,Authorization,Token,X-Token,X-User-Id,auth_token,x-request-id,X-Request-ID,x-session-id,X-Session-ID,Last-Event-ID'
       allow-methods: 'POST, GET, OPTIONS, PUT, DELETE, UPDATE'
-      expose-headers: 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Content-Type, New-Token, New-Expires-At'
+      expose-headers: 'Content-Length, Access-Control-Allow-Origin, Access-Control-Allow-Headers, Content-Type, New-Token, New-Expires-At, X-IM-Directory-Revision'
       allow-credentials: true
 
 # 认证配置：im 是资源服务，只保留共享 JWT 校验中间件，不提供登录端点。
