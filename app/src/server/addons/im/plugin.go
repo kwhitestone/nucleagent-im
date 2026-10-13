@@ -228,7 +228,22 @@ func (p *Plugin) Initialize(context.Context) error {
 // populated. webhookCapability is route-scoped because the webhook is a public
 // path that authenticates itself with a capability token instead of a JWT.
 func (p *Plugin) Middlewares() []gin.HandlerFunc {
-	return []gin.HandlerFunc{bridgeUserID(), webhookCapabilityMiddleware()}
+	return []gin.HandlerFunc{exposeDirectoryRevision(), bridgeUserID(), webhookCapabilityMiddleware()}
+}
+
+// exposeDirectoryRevision keeps X-IM-Directory-Revision readable by im-web on
+// every cross-origin response. prism-fusion's Cors() only uses the configured
+// expose list for whitelisted origins; other origins (e.g. the PROD outer
+// domain) get a hardcoded list without it.
+func exposeDirectoryRevision() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.Writer.Header()
+		if c.GetHeader("Origin") != "" && h.Get("Access-Control-Allow-Origin") != "" &&
+			!strings.Contains(h.Get("Access-Control-Expose-Headers"), "X-IM-Directory-Revision") {
+			h.Set("Access-Control-Expose-Headers", strings.TrimPrefix(h.Get("Access-Control-Expose-Headers")+", X-IM-Directory-Revision", ", "))
+		}
+		c.Next()
+	}
 }
 
 func (p *Plugin) Models() []interface{} {
