@@ -271,7 +271,7 @@ func (p *Plugin) initialHistory(ctx context.Context, row *IMWebhookInbox) ([]his
 		}
 		var payload textPayload
 		if json.Unmarshal([]byte(message.Payload), &payload) != nil || payload.Type != wuKongTextType ||
-			strings.TrimSpace(payload.Content) == "" {
+			strings.TrimSpace(payload.Content) == "" || payload.SystemNotice != "" {
 			continue
 		}
 		role := "user"
@@ -316,6 +316,12 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	}
 	global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
+	// Dead because the agent was stopped or deleted after admission: say so once.
+	if updates["state"] == inboxDead {
+		if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {
+			replyAgentUnavailable(context.Background(), global.PRISM_DB, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+		}
+	}
 }
 
 // bareToken accepts a token with or without the `Bearer ` scheme and returns it bare.

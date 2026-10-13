@@ -190,6 +190,7 @@ func (p *Plugin) Initialize(context.Context) error {
 	}
 	p.signer = signer
 	p.apiAddr = strings.TrimRight(apiAddr, "/")
+	wuKongAPIAddr = p.apiAddr
 	p.managerAddr = strings.TrimRight(managerAddr, "/")
 	p.wsAddr = wsAddr
 	p.webhookCapability = configValue("IM_WEBHOOK_CAPABILITY", "im.webhook-capability", "")

@@ -85,6 +85,9 @@ type textPayload struct {
 	// (see sendFinal). WuKong stores the payload verbatim, so the next hop reads a
 	// real chain depth instead of inferring one.
 	A2A *a2aProvenance `json:"a2a,omitempty"`
+	// SystemNotice marks a fixed bridge notice (agentUnavailableNotice): clients render
+	// it as a system line and it never feeds a model's history.
+	SystemNotice string `json:"systemNotice,omitempty"`
 }
 
 func (m mentionPayload) IsZero() bool { return m.All == 0 && len(m.UIDs) == 0 }
@@ -309,6 +312,7 @@ func acceptWebhookMessage(
 	if err != nil {
 		return 0, err
 	}
+	replyUnresolvedAgents(ctx, db, targets, resolved, message.ChannelType, channelID, uint(senderUID), now)
 
 	mentions, _ := json.Marshal(payload.Mention.UIDs)
 	accepted := 0
@@ -461,9 +465,11 @@ func agentMentionTargets(
 	// collation is case-INsensitive, so a SQL `username IN (...)` would quietly break
 	// the ruling's case-sensitivity requirement; group membership is bounded at
 	// maxGroupMembers, so this stays one small query either way.
+	// Disabled agents match too: resolveAgentTargets drops them and they get the
+	// agent-unavailable notice instead of silence (AGENT-REPLY-1).
 	var candidates []authmodel.User
 	if err := db.Select("id", "username").
-		Where("id IN ? AND enable = ? AND account_type = ?", groupMembers, 1, authmodel.AccountTypeAgent).
+		Where("id IN ? AND account_type = ?", groupMembers, authmodel.AccountTypeAgent).
 		Find(&candidates).Error; err != nil {
 		return nil, err
 	}
