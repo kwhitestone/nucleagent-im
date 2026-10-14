@@ -308,7 +308,7 @@ func acceptWebhookMessage(
 		return 0, nil
 	}
 
-	resolved, err := resolveAgentTargets(db, targets, message.ChannelType, uint(senderUID), origin.originUID)
+	resolved, err := resolveAgentTargets(db, targets, message.ChannelType, channelID, uint(senderUID), origin.originUID)
 	if err != nil {
 		return 0, err
 	}
@@ -385,12 +385,38 @@ func acceptWebhookMessage(
 
 type agentTarget struct{ agentUID, ownerUID uint }
 
-// resolveAgentTargets maps addressed agent UIDs to (agent, execution owner) pairs.
-// A legacy instance-level binding (M2) wins and keeps its owner. A UID with no
-// instance binding may be a definition-level identity shared by everyone: it runs
-// in the instance of whoever started the chain (the sender, or the human origin of
-// an A2A hop), mirroring Core's resolveIMBinding.
-func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, senderUID, originUID uint) ([]agentTarget, error) {
+type payerKind uint8
+
+const (
+	payerInstance     payerKind = iota + 1 // legacy M2 instance binding
+	payerPrivateAgent                      // user-built private agent (USERAGENT; not routed yet)
+	payerDefinition                        // system definition identity shared by everyone
+)
+
+// resolvePayer is the ONLY place that decides who an IM agent call runs as. Core
+// mints the model key for the conversation owner (issuer.go:75), so the execution
+// owner is also the billed user. 0 means reject: never fall back to the sender.
+//  1. instance binding        → the instance owner
+//  2. private agent           → its creator, in any channel (D66/D68)
+//  3. definition in a group   → the group owner (D68 1A)
+//  4. definition in a DM      → whoever started the chain
+func resolvePayer(kind payerKind, channelType uint8, instanceOwner, groupOwner, creator, originUID uint) uint {
+	switch {
+	case kind == payerInstance:
+		return instanceOwner
+	case kind == payerPrivateAgent:
+		return creator
+	case kind == payerDefinition && channelType == groupChannel:
+		return groupOwner
+	case kind == payerDefinition:
+		return originUID
+	}
+	return 0
+}
+
+// resolveAgentTargets maps addressed agent UIDs to (agent, execution owner) pairs via
+// resolvePayer. A group whose owner cannot be found yields no definition target.
+func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, channelID string, senderUID, originUID uint) ([]agentTarget, error) {
 	var enabled []uint
 	if err := db.Model(&authmodel.User{}).
 		Where("id IN ? AND enable = ? AND account_type = ?", targets, 1, authmodel.AccountTypeAgent).
@@ -411,7 +437,9 @@ func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, senderU
 		if !bindings[i].IMEnabled || (channelType == personChannel && bindings[i].UserID != senderUID) {
 			continue
 		}
-		out = append(out, agentTarget{agentUID, bindings[i].UserID})
+		if owner := resolvePayer(payerInstance, channelType, bindings[i].UserID, 0, 0, originUID); owner != 0 {
+			out = append(out, agentTarget{agentUID, owner})
+		}
 	}
 	if len(rest) == 0 {
 		return out, nil
@@ -420,8 +448,22 @@ func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, senderU
 	if err := db.Where("auth_agent_user_id IN ? AND is_active = ?", rest, true).Find(&definitions).Error; err != nil {
 		return nil, err
 	}
+	var groupOwner uint
+	if channelType == groupChannel && len(definitions) != 0 {
+		var group IMGroup
+		if err := db.Select("creator_uid").Where("group_id = ?", channelID).Limit(1).Find(&group).Error; err != nil {
+			return nil, err
+		}
+		groupOwner = group.CreatorUID
+	}
 	for i := range definitions {
-		out = append(out, agentTarget{*definitions[i].AuthAgentUserID, originUID})
+		agentUID := *definitions[i].AuthAgentUserID
+		owner := resolvePayer(payerDefinition, channelType, 0, groupOwner, 0, originUID)
+		if owner == 0 {
+			slog.Warn("im agent target dropped: no payer", "agent_uid", agentUID, "channel_type", channelType)
+			continue
+		}
+		out = append(out, agentTarget{agentUID, owner})
 	}
 	return out, nil
 }
