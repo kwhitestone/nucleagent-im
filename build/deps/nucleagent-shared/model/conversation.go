@@ -27,4 +27,10 @@ type Conversation struct {
 	CreatedAt       time.Time  `json:"createdAt" gorm:"column:created_at;comment:创建时间"`
 	UpdatedAt       time.Time  `json:"updatedAt" gorm:"column:updated_at;comment:更新时间"`
 	CompletedAt     *time.Time `json:"completedAt" gorm:"column:completed_at;comment:完成时间"`
+	// DeletedAt/DeletedBy are the owner's soft-delete tombstone (UI-IMPL-5).
+	// Deliberately not gorm.DeletedAt (same as AgentDefinition): billing, call
+	// logs, steps, media tasks, attachments and artifacts keep resolving the
+	// row; user-facing readers filter on it explicitly. Never auto-purged.
+	DeletedAt *time.Time `json:"deletedAt" gorm:"column:deleted_at;index;comment:用户删除时间(墓碑,非空=已删除)"`
+	DeletedBy *uint      `json:"deletedBy" gorm:"column:deleted_by;comment:删除操作者用户ID"`
 }

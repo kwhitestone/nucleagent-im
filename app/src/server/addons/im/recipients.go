@@ -26,7 +26,8 @@ type recipientOutput struct {
 func recipientEnabled(ctx context.Context, db *gorm.DB, uid uint) (bool, error) {
 	var count int64
 	err := db.WithContext(ctx).Model(&authmodel.User{}).
-		Where("id = ? AND enable = ?", uid, 1).Count(&count).Error
+		Where("id = ? AND enable = ?", uid, 1).
+		Where("id NOT IN (?)", privateOwnerOffUIDs(db.WithContext(ctx))).Count(&count).Error
 	return count == 1, err
 }
 
@@ -40,6 +41,13 @@ func (p *Plugin) registerRecipients(api huma.API) {
 		Security:    []map[string][]string{{"AuthTokenAuth": {}}},
 	}, func(ctx context.Context, input *recipientInput) (*recipientOutput, error) {
 		enabled, err := recipientEnabled(ctx, global.PRISM_DB, input.UID)
+		if err == nil && enabled {
+			// Another user's private agent reads exactly like a nonexistent uid.
+			var hidden bool
+			viewer, _ := ctx.Value(userIDKey).(uint)
+			hidden, err = privateAgentHidden(global.PRISM_DB.WithContext(ctx), input.UID, viewer)
+			enabled = !hidden
+		}
 		if err != nil {
 			return nil, newIMProblem(http.StatusServiceUnavailable, "im_recipient_unavailable", "recipient status is unavailable")
 		}

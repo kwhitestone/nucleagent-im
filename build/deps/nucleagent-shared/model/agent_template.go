@@ -29,9 +29,22 @@ type AgentTemplate struct {
 	// gorm.DeletedAt: history (conversations, instances, IM routing) must keep
 	// resolving the row; readers that list or start work filter on it.
 	// A deleted definition is always also is_active=false.
-	DeletedAt *time.Time `json:"deletedAt" gorm:"column:deleted_at;comment:删除时间(墓碑,非空=已删除)"`
+	DeletedAt *time.Time `json:"deletedAt" gorm:"column:deleted_at;index:idx_agent_tpl_owner_deleted,priority:2;comment:删除时间(墓碑,非空=已删除)"`
 	DeletedBy *uint      `json:"deletedBy" gorm:"column:deleted_by;comment:删除操作者用户ID"`
+
+	// OwnerUserID/Visibility mark user-created definitions (USERAGENT U1).
+	// Legacy and admin rows are system/ownerless; a private row must have an
+	// owner (table check constraint). User-facing reads must go through core's
+	// visibleTo scope. Kept out of JSON until the user API (U2) is cleared.
+	OwnerUserID *uint  `json:"-" gorm:"column:owner_user_id;index:idx_agent_tpl_owner_deleted,priority:1;comment:创建者用户ID(私有定义必填,系统定义为空)"`
+	Visibility  string `json:"-" gorm:"column:visibility;size:16;not null;default:system;check:chk_agent_tpl_visibility,visibility IN ('system','private') AND (visibility <> 'private' OR owner_user_id IS NOT NULL);comment:可见范围(system/private)"`
 }
+
+// Agent definition visibility values (phase 1 has only these two).
+const (
+	AgentVisibilitySystem  = "system"
+	AgentVisibilityPrivate = "private"
+)
 
 // AgentDefinitionAudit is one admin change to an agent definition (AG1).
 // Prompt text is never stored, only its SHA-256 before and after.

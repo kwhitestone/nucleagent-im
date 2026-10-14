@@ -445,7 +445,12 @@ func resolveAgentTargets(db *gorm.DB, targets []uint, channelType uint8, channel
 		return out, nil
 	}
 	var definitions []model.AgentTemplate
-	if err := db.Where("auth_agent_user_id IN ? AND is_active = ?", rest, true).Find(&definitions).Error; err != nil {
+	viewer := uint(0) // private definitions never run in a group, not even for the owner
+	if channelType == personChannel {
+		viewer = senderUID
+	}
+	if err := db.Scopes(agentVisibleTo(viewer)).
+		Where("auth_agent_user_id IN ? AND is_active = ?", rest, true).Find(&definitions).Error; err != nil {
 		return nil, err
 	}
 	var groupOwner uint

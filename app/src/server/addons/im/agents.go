@@ -59,11 +59,45 @@ func directoryRevision(value any) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// listDirectoryAgents is the set resolveAgentTargets admits for a DM by
-// definition: active template, IM identity set, enabled agent account.
-func listDirectoryAgents(ctx context.Context, db *gorm.DB) ([]directoryAgent, error) {
+// USERAGENT U4: a private (user-created) agent exists only for its owner, and
+// only in a DM. Everyone else, and every group, sees it as a nonexistent uid.
+// viewer 0 means "no owner context" (a group): every private agent is hidden.
+func agentVisibleTo(viewer uint) func(*gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		return db.Where("(visibility <> ? OR owner_user_id = ? AND "+ownerActive+")", model.AgentVisibilityPrivate, viewer)
+	}
+}
+
+// ownerActive (D2=A, D82): a private definition's owner is enabled and not
+// deleted; otherwise the private agent is out of service, read-time, so
+// restoring the owner restores it. Primary key lookup on users, no scan.
+const ownerActive = "EXISTS (SELECT 1 FROM users o WHERE o.id = agent_templates.owner_user_id " +
+	"AND o.enable = 1 AND o.deleted_at IS NULL)"
+
+// privateOwnerOffUIDs selects private agent accounts whose owner is disabled or deleted.
+func privateOwnerOffUIDs(db *gorm.DB) *gorm.DB {
+	return privateAgentUIDs(db).Where("NOT " + ownerActive)
+}
+
+// privateAgentUIDs selects every agent account bound to a private definition,
+// stopped or deleted included: privacy outlives the definition state.
+func privateAgentUIDs(db *gorm.DB) *gorm.DB {
+	return db.Model(&model.AgentTemplate{}).Select("auth_agent_user_id").
+		Where("visibility = ? AND auth_agent_user_id IS NOT NULL", model.AgentVisibilityPrivate)
+}
+
+// privateAgentHidden reports whether uid is a private agent viewer does not own.
+func privateAgentHidden(db *gorm.DB, uid, viewer uint) (bool, error) {
+	var n int64
+	err := privateAgentUIDs(db).Where("auth_agent_user_id = ? AND owner_user_id <> ?", uid, viewer).Count(&n).Error
+	return n > 0, err
+}
+
+// listDirectoryAgents is the set resolveAgentTargets admits for viewer's DM by
+// definition: active template visible to viewer, IM identity set, enabled agent account.
+func listDirectoryAgents(ctx context.Context, db *gorm.DB, viewer uint) ([]directoryAgent, error) {
 	var templates []model.AgentTemplate
-	if err := db.WithContext(ctx).
+	if err := db.WithContext(ctx).Scopes(agentVisibleTo(viewer)).
 		Where("is_active = ? AND deleted_at IS NULL AND auth_agent_user_id IS NOT NULL", true).
 		Order("name ASC, id ASC").Find(&templates).Error; err != nil {
 		return nil, err
@@ -117,7 +151,7 @@ func authorizedDirectory(ctx context.Context) ([]directoryAgent, error) {
 	if !enabled {
 		return nil, newIMProblem(http.StatusForbidden, "im_recipient_disabled", "account is disabled")
 	}
-	agents, err := listDirectoryAgents(ctx, global.PRISM_DB)
+	agents, err := listDirectoryAgents(ctx, global.PRISM_DB, userID)
 	if err != nil {
 		return nil, newIMProblem(http.StatusServiceUnavailable, "im_agents_unavailable", "agent directory is unavailable")
 	}
