@@ -10,7 +10,7 @@
     "name": "nucleagent-shared",
     "module": "github.com/nucleagent/nucleagent-shared",
     "path": ".",
-    "commit": "ba965e60243aa5c208f90a35f15dd3ab295d434e"
+    "commit": "809fd4d8f8efbd9c71b84315fed0ec5a3e18b4eb"
   },
   {
     "name": "nucleagent-storage",
