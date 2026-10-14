@@ -220,3 +220,11 @@ func TestOwnerNotFoundNotifiesGroupOnce(t *testing.T) {
 		t.Fatalf("nothing may be requeued, %d live rows", count)
 	}
 }
+
+// C6: the allowlist response tells the group owner who pays.
+func TestAllowlistResponseCarriesBillingNotice(t *testing.T) {
+	got := allowlistResponse(IMGroup{ID: 1, CreatorUID: 1}, 42, []uint{2}).Body.Data.BillingNotice
+	if got != allowlistBillingNotice || got != "加入后此人在本群调用智能体的费用由你承担" {
+		t.Fatalf("billing notice=%q", got)
+	}
+}
