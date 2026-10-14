@@ -64,8 +64,19 @@ func directoryRevision(value any) string {
 // viewer 0 means "no owner context" (a group): every private agent is hidden.
 func agentVisibleTo(viewer uint) func(*gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
-		return db.Where("(visibility <> ? OR owner_user_id = ?)", model.AgentVisibilityPrivate, viewer)
+		return db.Where("(visibility <> ? OR owner_user_id = ? AND "+ownerActive+")", model.AgentVisibilityPrivate, viewer)
 	}
+}
+
+// ownerActive (D2=A, D82): a private definition's owner is enabled and not
+// deleted; otherwise the private agent is out of service, read-time, so
+// restoring the owner restores it. Primary key lookup on users, no scan.
+const ownerActive = "EXISTS (SELECT 1 FROM users o WHERE o.id = agent_templates.owner_user_id " +
+	"AND o.enable = 1 AND o.deleted_at IS NULL)"
+
+// privateOwnerOffUIDs selects private agent accounts whose owner is disabled or deleted.
+func privateOwnerOffUIDs(db *gorm.DB) *gorm.DB {
+	return privateAgentUIDs(db).Where("NOT " + ownerActive)
 }
 
 // privateAgentUIDs selects every agent account bound to a private definition,

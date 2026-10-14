@@ -41,6 +41,10 @@ func agentUnavailable(db *gorm.DB, uid uint) (bool, error) {
 	if user.Enable != 1 {
 		return true, nil
 	}
+	var ownerOff int64
+	if err := privateOwnerOffUIDs(db).Where("auth_agent_user_id = ?", uid).Count(&ownerOff).Error; err != nil || ownerOff > 0 {
+		return ownerOff > 0, err // D2=A: the owner is disabled or deleted
+	}
 	var definition model.AgentTemplate
 	if err := db.Select("id", "is_active", "deleted_at").Where("auth_agent_user_id = ?", uid).
 		Limit(1).Find(&definition).Error; err != nil || definition.ID == 0 {

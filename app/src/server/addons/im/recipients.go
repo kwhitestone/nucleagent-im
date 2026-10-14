@@ -26,7 +26,8 @@ type recipientOutput struct {
 func recipientEnabled(ctx context.Context, db *gorm.DB, uid uint) (bool, error) {
 	var count int64
 	err := db.WithContext(ctx).Model(&authmodel.User{}).
-		Where("id = ? AND enable = ?", uid, 1).Count(&count).Error
+		Where("id = ? AND enable = ?", uid, 1).
+		Where("id NOT IN (?)", privateOwnerOffUIDs(db.WithContext(ctx))).Count(&count).Error
 	return count == 1, err
 }
 
