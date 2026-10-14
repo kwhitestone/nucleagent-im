@@ -103,20 +103,20 @@ func TestUserAgentI1DirectoryHidesOthersPrivate(t *testing.T) {
 // owner in a direct chat; never for another sender, never in a group.
 func TestUserAgentI2ResolveOnlyOwnerDirect(t *testing.T) {
 	db := uaFixture(t)
-	got, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, uaOwner, uaOwner)
+	got, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, "", uaOwner, uaOwner)
 	if err != nil || len(got) != 1 || got[0].agentUID != uaPrivate || got[0].ownerUID != uaOwner {
 		t.Fatalf("precondition: owner DM must resolve own private agent, got %+v err=%v", got, err)
 	}
-	if got, _ := resolveAgentTargets(db, []uint{uaSystem}, groupChannel, uaOther, uaOther); len(got) != 1 {
+	if got, _ := resolveAgentTargets(db, []uint{uaSystem}, groupChannel, "ua-g1", uaOther, uaOther); len(got) != 1 {
 		t.Fatalf("system agent must stay callable in a group, got %+v", got)
 	}
-	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, uaOther, uaOther); err != nil || len(got) != 0 {
+	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, "", uaOther, uaOther); err != nil || len(got) != 0 {
 		t.Fatalf("I2: B's DM resolves A's private agent: %+v err=%v", got, err)
 	}
-	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, groupChannel, uaOther, uaOther); err != nil || len(got) != 0 {
+	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, groupChannel, "ua-g1", uaOther, uaOther); err != nil || len(got) != 0 {
 		t.Fatalf("I2: B's group @ resolves A's private agent: %+v err=%v", got, err)
 	}
-	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, groupChannel, uaOwner, uaOwner); err != nil || len(got) != 0 {
+	if got, err := resolveAgentTargets(db, []uint{uaPrivate}, groupChannel, "ua-g1", uaOwner, uaOwner); err != nil || len(got) != 0 {
 		t.Fatalf("I2: phase 1 private agents never run in a group, even for the owner: %+v err=%v", got, err)
 	}
 	// End to end: B's DM to A's private agent must create no Core task.

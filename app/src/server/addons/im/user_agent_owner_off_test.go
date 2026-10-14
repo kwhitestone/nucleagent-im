@@ -26,7 +26,7 @@ func TestUserAgentD2OwnerOffStopsPrivateAgent(t *testing.T) {
 			listed = listed || a.UID == uaPrivate
 			system = system || a.UID == uaSystem
 		}
-		targets, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, uaOwner, uaOwner)
+		targets, err := resolveAgentTargets(db, []uint{uaPrivate}, personChannel, "", uaOwner, uaOwner)
 		if err != nil {
 			t.Fatal(err)
 		}
