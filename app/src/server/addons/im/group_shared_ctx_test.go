@@ -190,3 +190,33 @@ func TestOtherConflictStaysTerminalAndSilent(t *testing.T) {
 		t.Fatalf("other 409: state=%s next=%v notices=%d", row.State, row.NextAttemptAt, len(*sent))
 	}
 }
+
+// G4/C11: the group owner (execution owner) is gone → one zero-cost notice per
+// group/agent per 10 minutes; private chats and other 404s stay silent.
+func TestOwnerNotFoundNotifiesGroupOnce(t *testing.T) {
+	db := m2DB(t)
+	sent, _ := noticeServer(t, false)
+	gone := &httpStatusError{status: http.StatusNotFound, code: "im_execution_owner_not_found"}
+	p := &Plugin{}
+	for i := range 2 {
+		row := busyRow(t, fmt.Sprint("owner-", i), 1)
+		p.failInbox(&row, gone, fixedNoticeTime)
+		db.First(&row, row.ID)
+		if row.State != inboxDead || row.NextAttemptAt != nil {
+			t.Fatalf("owner gone must die: state=%s", row.State)
+		}
+	}
+	private := busyRow(t, "owner-p", 1)
+	private.ChannelType, private.ChannelID = personChannel, "1@42"
+	p.failInbox(&private, gone, fixedNoticeTime)
+	other := busyRow(t, "other-404", 1)
+	p.failInbox(&other, &httpStatusError{status: http.StatusNotFound, code: "upstream_http_404"}, fixedNoticeTime)
+	if got := noticeTexts(t, *sent); len(got) != 1 || got[0] != ownerUnavailableText || (*sent)[0].ChannelID != "g1" {
+		t.Fatalf("owner notices=%v", got)
+	}
+	var count int64
+	db.Model(&IMWebhookInbox{}).Where("state <> ?", inboxDead).Count(&count)
+	if count != 0 {
+		t.Fatalf("nothing may be requeued, %d live rows", count)
+	}
+}

@@ -30,9 +30,12 @@ var retryDelays = []time.Duration{
 }
 
 const (
-	conversationBusyCode = "im_conversation_busy"
-	busyTimeoutScope     = "busy_timeout_reply"
-	busyTimeoutText      = "排队超时，请稍后重新 @"
+	conversationBusyCode  = "im_conversation_busy"
+	busyTimeoutScope      = "busy_timeout_reply"
+	busyTimeoutText       = "排队超时，请稍后重新 @"
+	ownerNotFoundCode     = "im_execution_owner_not_found"
+	ownerUnavailableScope = "owner_unavailable_reply"
+	ownerUnavailableText  = "群主账号当前不可用，本群暂时不能调用智能体，请联系群主。"
 )
 
 type httpStatusError struct {
@@ -369,6 +372,11 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	if updates["state"] == inboxDead && code == conversationBusyCode {
 		// ponytail: retry order is not first-come-first-served; a per-(group,agent,owner) lease is P1.
 		replyNotice(context.Background(), global.PRISM_DB, busyTimeoutScope, busyTimeoutText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+		return
+	}
+	if updates["state"] == inboxDead && code == ownerNotFoundCode && row.ChannelType != personChannel {
+		// G4: Core refused before any model call (zero cost); tell the group why.
+		replyNotice(context.Background(), global.PRISM_DB, ownerUnavailableScope, ownerUnavailableText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
 		return
 	}
 	// Dead because the agent was stopped or deleted after admission: say so once.
