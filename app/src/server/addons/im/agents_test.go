@@ -77,7 +77,7 @@ func TestAgentDirectoryFreshLifecycle(t *testing.T) {
 	addDefinition(t, db, 42, true)
 	assertCount := func(want int) {
 		t.Helper()
-		rows, err := listDirectoryAgents(t.Context(), db)
+		rows, err := listDirectoryAgents(t.Context(), db, 0)
 		if err != nil || len(rows) != want {
 			t.Fatalf("directory count=%d want=%d err=%v", len(rows), want, err)
 		}

@@ -529,7 +529,8 @@ func normalizedUIDs(raw []uint, limit int) ([]uint, error) {
 func validateUsers(ctx context.Context, ids []uint, code, detail string) error {
 	var count int64
 	if global.PRISM_DB == nil || global.PRISM_DB.WithContext(ctx).Model(&authmodel.User{}).
-		Where("id IN ? AND enable = ?", ids, 1).Count(&count).Error != nil {
+		Where("id IN ? AND enable = ?", ids, 1).
+		Where("id NOT IN (?)", privateAgentUIDs(global.PRISM_DB.WithContext(ctx))).Count(&count).Error != nil {
 		return newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "user validation is unavailable")
 	}
 	if count != int64(len(ids)) {
@@ -542,7 +543,7 @@ func validateAgent(ctx context.Context, uid uint) error {
 	var count int64
 	if global.PRISM_DB == nil || global.PRISM_DB.WithContext(ctx).Model(&authmodel.User{}).
 		Where("id = ? AND enable = ? AND account_type = ?", uid, 1, authmodel.AccountTypeAgent).
-		Count(&count).Error != nil {
+		Where("id NOT IN (?)", privateAgentUIDs(global.PRISM_DB.WithContext(ctx))).Count(&count).Error != nil {
 		return newIMProblem(http.StatusServiceUnavailable, "im_unavailable", "agent validation is unavailable")
 	}
 	if count == 0 {

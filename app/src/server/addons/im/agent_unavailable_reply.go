@@ -90,6 +90,16 @@ func replyUnresolvedAgents(
 			continue
 		}
 		off, err := agentUnavailable(db, uid)
+		if err == nil && off {
+			// Another user's private agent answers like an unknown uid: silence.
+			viewer := uint(0)
+			if channelType == personChannel {
+				viewer = senderUID
+			}
+			var hidden bool
+			hidden, err = privateAgentHidden(db, uid, viewer)
+			off = !hidden
+		}
 		if err == nil && off && channelType == groupChannel {
 			off, err = isGroupMember(ctx, channelID, uid)
 		}
