@@ -110,7 +110,11 @@ type allowlistData struct {
 	OwnerUID      uint   `json:"ownerUid"`
 	OwnerImplicit bool   `json:"ownerImplicit"`
 	MemberUIDs    []uint `json:"memberUids"`
+	// C6: shown next to "add member"; group calls run and bill as the group owner.
+	BillingNotice string `json:"billingNotice"`
 }
+
+const allowlistBillingNotice = "加入后此人在本群调用智能体的费用由你承担"
 
 type allowlistOutput struct {
 	Body envelope[allowlistData]
@@ -163,6 +167,8 @@ func (p *Plugin) registerGroups(api huma.API) {
 		OperationID: "imReplaceGroupAgentAllowlist", Method: http.MethodPut,
 		Path:    "/api/v1/im/groups/{id}/agents/{agentUid}/allowlist",
 		Summary: "Replace an agent invocation allowlist", Tags: []string{"IM"},
+		Description: "Only the group owner may call this. 加入后此人在本群调用智能体的费用由你承担" +
+			" (group @-calls of a definition agent run and bill as the group owner).",
 		Security: []map[string][]string{{"AuthTokenAuth": {}}},
 	}, p.replaceAllowlist)
 	huma.Register(api, huma.Operation{
@@ -834,7 +840,7 @@ func allowlistResponse(group IMGroup, agentUID uint, members []uint) *allowlistO
 		Code: 0, Message: "success",
 		Data: allowlistData{
 			GroupID: group.ID, AgentUID: agentUID, OwnerUID: group.CreatorUID,
-			OwnerImplicit: true, MemberUIDs: members,
+			OwnerImplicit: true, MemberUIDs: members, BillingNotice: allowlistBillingNotice,
 		},
 	}}
 }
