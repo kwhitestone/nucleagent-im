@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
 	authservice "github.com/kwhitestone/prism-fusion/addons/auth/service"
@@ -27,6 +28,15 @@ import (
 var retryDelays = []time.Duration{
 	time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute,
 }
+
+const (
+	conversationBusyCode  = "im_conversation_busy"
+	busyTimeoutScope      = "busy_timeout_reply"
+	busyTimeoutText       = "排队超时，请稍后重新 @"
+	ownerNotFoundCode     = "im_execution_owner_not_found"
+	ownerUnavailableScope = "owner_unavailable_reply"
+	ownerUnavailableText  = "群主账号当前不可用，本群暂时不能调用智能体，请联系群主。"
+)
 
 type httpStatusError struct {
 	status int
@@ -221,10 +231,16 @@ func (p *Plugin) dispatchCore(ctx context.Context, row *IMWebhookInbox, history 
 	if err != nil {
 		return nil, err
 	}
+	text := row.Text
+	if row.ChannelType != personChannel {
+		// G3: a shared group conversation must know who is speaking. Same "[name]: " form
+		// Core already uses for group history; the inbox keeps the raw text.
+		text = "[" + userLabel(ctx, row.SenderUID) + "]: " + text
+	}
 	input := dispatchRequest{
 		SourceKey: row.SourceKey, ExecutionOwnerUserID: row.ExecutionOwnerUserID,
 		AgentUID: row.TargetAgentUID, Channel: dispatchChannel{ID: row.ChannelID, Type: int(row.ChannelType)},
-		Input: row.Text, InitialHistory: history,
+		Input: text, InitialHistory: history,
 		AdmittedAt: row.CreatedAt.UTC(),
 		Provenance: &a2aProvenance{
 			ChainID: row.ChainID, Depth: row.ChainDepth,
@@ -258,10 +274,7 @@ func (p *Plugin) initialHistory(ctx context.Context, row *IMWebhookInbox) ([]his
 	var users []authmodel.User
 	if err := global.PRISM_DB.Select("id", "nick_name", "username").Find(&users).Error; err == nil {
 		for i := range users {
-			names[users[i].ID] = strings.TrimSpace(users[i].NickName)
-			if names[users[i].ID] == "" {
-				names[users[i].ID] = users[i].Username
-			}
+			names[users[i].ID] = speakerLabel(displayName(users[i]), users[i].ID)
 		}
 	}
 	candidates := make([]historyTurn, 0, len(recent))
@@ -298,13 +311,53 @@ func (p *Plugin) initialHistory(ctx context.Context, row *IMWebhookInbox) ([]his
 	return turns, nil
 }
 
+func displayName(user authmodel.User) string {
+	if name := strings.TrimSpace(user.NickName); name != "" {
+		return name
+	}
+	return user.Username
+}
+
+// userLabel is the cleaned speaker label for uid; the uid itself when the user is unknown.
+func userLabel(ctx context.Context, uid uint) string {
+	var user authmodel.User
+	if err := global.PRISM_DB.WithContext(ctx).Select("id", "nick_name", "username").
+		Where("id = ?", uid).Limit(1).Find(&user).Error; err != nil || user.ID == 0 {
+		return speakerLabel("", uid)
+	}
+	return speakerLabel(displayName(user), uid)
+}
+
+// speakerLabel makes a nickname safe inside "[name]: ": one line, no brackets or colons
+// (C14: a nickname must not fake another speaker or a role), at most 32 runes.
+func speakerLabel(name string, uid uint) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsSpace(r):
+			return ' '
+		case unicode.IsControl(r), r == '[', r == ']', r == ':', r == '：':
+			return -1
+		}
+		return r
+	}, name)
+	runes := []rune(strings.Join(strings.Fields(cleaned), " "))
+	if len(runes) > 32 {
+		runes = []rune(strings.TrimSpace(string(runes[:32])))
+	}
+	if len(runes) == 0 {
+		return strconv.FormatUint(uint64(uid), 10)
+	}
+	return string(runes)
+}
+
 func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	code := "im_internal_error"
 	retryable := true
 	var upstream *httpStatusError
 	if errors.As(err, &upstream) {
 		code = upstream.code
-		retryable = upstream.status == http.StatusTooManyRequests || upstream.status >= 500
+		retryable = upstream.status == http.StatusTooManyRequests || upstream.status >= 500 ||
+			upstream.code == conversationBusyCode // G2: wait in line behind the running turn
 	}
 	updates := map[string]any{
 		"state": inboxDead, "lease_owner": "", "lease_expires_at": nil,
@@ -316,6 +369,16 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	}
 	global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
+	if updates["state"] == inboxDead && code == conversationBusyCode {
+		// ponytail: retry order is not first-come-first-served; a per-(group,agent,owner) lease is P1.
+		replyNotice(context.Background(), global.PRISM_DB, busyTimeoutScope, busyTimeoutText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+		return
+	}
+	if updates["state"] == inboxDead && code == ownerNotFoundCode && row.ChannelType != personChannel {
+		// G4: Core refused before any model call (zero cost); tell the group why.
+		replyNotice(context.Background(), global.PRISM_DB, ownerUnavailableScope, ownerUnavailableText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+		return
+	}
 	// Dead because the agent was stopped or deleted after admission: say so once.
 	if updates["state"] == inboxDead {
 		if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {
