@@ -107,6 +107,10 @@ func TestUserAgentI2ResolveOnlyOwnerDirect(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].agentUID != uaPrivate || got[0].ownerUID != uaOwner {
 		t.Fatalf("precondition: owner DM must resolve own private agent, got %+v err=%v", got, err)
 	}
+	// G1: a group call resolves the payer from the group owner, so the group must exist.
+	if err := db.Create(&IMGroup{GroupID: "ua-g1", CreatorUID: uaOther}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if got, _ := resolveAgentTargets(db, []uint{uaSystem}, groupChannel, "ua-g1", uaOther, uaOther); len(got) != 1 {
 		t.Fatalf("system agent must stay callable in a group, got %+v", got)
 	}
