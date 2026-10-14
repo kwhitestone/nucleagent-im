@@ -50,8 +50,12 @@ func agentUnavailable(db *gorm.DB, uid uint) (bool, error) {
 }
 
 func agentUnavailableClientMsgNo(window time.Time, channelType uint8, channelID string, agentUID uint) string {
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s:%d:%s:%d", window.UTC().Format(time.RFC3339), channelType, channelID, agentUID))
-	return "agent-unavailable-" + hex.EncodeToString(sum[:16])
+	return noticeClientMsgNo(agentUnavailableScope, window, channelType, channelID, agentUID)
+}
+
+func noticeClientMsgNo(scope string, window time.Time, channelType uint8, channelID string, agentUID uint) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s:%s:%d:%s:%d", scope, window.UTC().Format(time.RFC3339), channelType, channelID, agentUID))
+	return "agent-notice-" + hex.EncodeToString(sum[:16])
 }
 
 // replyAgentUnavailable posts the notice as the agent, at most once per
@@ -60,21 +64,27 @@ func agentUnavailableClientMsgNo(window time.Time, channelType uint8, channelID 
 // and the deterministic client_msg_no makes a retried send land once.
 // Failures are logged, never returned: a notice must not fail message intake.
 func replyAgentUnavailable(ctx context.Context, db *gorm.DB, channelType uint8, channelID string, agentUID uint, now time.Time) {
+	replyNotice(ctx, db, agentUnavailableScope, agentUnavailableText, channelType, channelID, agentUID, now)
+}
+
+// replyNotice posts a fixed zero-cost system notice as the agent, once per
+// (scope, channel, agent) per 10-minute window.
+func replyNotice(ctx context.Context, db *gorm.DB, scope, text string, channelType uint8, channelID string, agentUID uint, now time.Time) {
 	window := now.UTC().Truncate(agentUnavailableWindow)
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := takeWindow(tx, agentUnavailableScope, rateKey(channelType, channelID, agentUID), 1, window); err != nil {
+		if err := takeWindow(tx, scope, rateKey(channelType, channelID, agentUID), 1, window); err != nil {
 			return err
 		}
-		payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: agentUnavailableText, SystemNotice: agentUnavailableNotice})
+		payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: text, SystemNotice: agentUnavailableNotice})
 		return postWuKong(ctx, wuKongAPIAddr, "/message/send", map[string]any{
 			"from_uid":   fmt.Sprint(agentUID),
 			"channel_id": channelID, "channel_type": channelType,
-			"client_msg_no": agentUnavailableClientMsgNo(window, channelType, channelID, agentUID),
+			"client_msg_no": noticeClientMsgNo(scope, window, channelType, channelID, agentUID),
 			"payload":       base64.StdEncoding.EncodeToString(payload),
 		}, nil)
 	})
 	if err != nil && err != errAgentRateLimited {
-		slog.Warn("im agent unavailable notice failed", "agent_uid", agentUID, "channel_type", channelType, "error", err)
+		slog.Warn("im agent notice failed", "scope", scope, "agent_uid", agentUID, "channel_type", channelType, "error", err)
 	}
 }
 

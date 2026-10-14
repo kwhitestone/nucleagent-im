@@ -136,7 +136,7 @@ func TestDispatchTwoTurnsAndReconnect(t *testing.T) {
 	}
 }
 
-func TestDispatchBusyRemainsTerminalDomainError(t *testing.T) {
+func TestDispatchBusyIsRetried(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
@@ -166,7 +166,8 @@ func TestDispatchBusyRemainsTerminalDomainError(t *testing.T) {
 	if err := db.First(&row, row.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.State != inboxDead || row.LastErrorCode != "im_conversation_busy" || row.NextAttemptAt != nil {
+	// G2: busy now waits on the retry schedule instead of dying on the first try.
+	if row.State != inboxRetryable || row.LastErrorCode != "im_conversation_busy" || row.NextAttemptAt == nil {
 		t.Fatalf("busy handling: state=%s code=%s retry=%v", row.State, row.LastErrorCode, row.NextAttemptAt)
 	}
 }

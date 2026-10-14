@@ -29,6 +29,12 @@ var retryDelays = []time.Duration{
 	time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute,
 }
 
+const (
+	conversationBusyCode = "im_conversation_busy"
+	busyTimeoutScope     = "busy_timeout_reply"
+	busyTimeoutText      = "排队超时，请稍后重新 @"
+)
+
 type httpStatusError struct {
 	status int
 	code   string
@@ -347,7 +353,8 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	var upstream *httpStatusError
 	if errors.As(err, &upstream) {
 		code = upstream.code
-		retryable = upstream.status == http.StatusTooManyRequests || upstream.status >= 500
+		retryable = upstream.status == http.StatusTooManyRequests || upstream.status >= 500 ||
+			upstream.code == conversationBusyCode // G2: wait in line behind the running turn
 	}
 	updates := map[string]any{
 		"state": inboxDead, "lease_owner": "", "lease_expires_at": nil,
@@ -359,6 +366,11 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 	}
 	global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
+	if updates["state"] == inboxDead && code == conversationBusyCode {
+		// ponytail: retry order is not first-come-first-served; a per-(group,agent,owner) lease is P1.
+		replyNotice(context.Background(), global.PRISM_DB, busyTimeoutScope, busyTimeoutText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+		return
+	}
 	// Dead because the agent was stopped or deleted after admission: say so once.
 	if updates["state"] == inboxDead {
 		if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {

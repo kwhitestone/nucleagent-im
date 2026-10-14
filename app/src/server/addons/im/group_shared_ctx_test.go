@@ -121,3 +121,72 @@ func TestFirstTurnHistoryOmitsTriggerAndCleansNames(t *testing.T) {
 		t.Fatalf("turns=%+v", turns)
 	}
 }
+
+func busyRow(t *testing.T, id string, attempts int) IMWebhookInbox {
+	t.Helper()
+	row := IMWebhookInbox{
+		Event: "msg.notify", MessageIDStr: id, TargetAgentUID: 42, SenderUID: 1,
+		ChannelID: "g1", ChannelType: groupChannel, Text: "prompt", State: inboxProcessing,
+		ExecutionOwnerUserID: 1, SourceKey: id, LeaseOwner: "worker", Attempts: attempts,
+	}
+	if err := global.PRISM_DB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func noticeTexts(t *testing.T, sent []noticeSend) []string {
+	t.Helper()
+	var texts []string
+	for _, s := range sent {
+		var p textPayload
+		if err := json.Unmarshal(s.Payload, &p); err != nil {
+			t.Fatal(err)
+		}
+		texts = append(texts, p.Content)
+	}
+	return texts
+}
+
+// G2/C13: a busy shared conversation is retried on the normal schedule; only the
+// 6th busy attempt dies, and then the group sees one timeout notice.
+func TestBusyRetriesThenTimesOutWithNotice(t *testing.T) {
+	db := m2DB(t)
+	sent, _ := noticeServer(t, false)
+	busy := &httpStatusError{status: http.StatusConflict, code: "im_conversation_busy"}
+	p := &Plugin{}
+	for attempt := 1; attempt <= len(retryDelays); attempt++ {
+		row := busyRow(t, fmt.Sprint("busy-", attempt), attempt)
+		p.failInbox(&row, busy, fixedNoticeTime)
+		db.First(&row, row.ID)
+		if row.State != inboxRetryable || row.NextAttemptAt == nil ||
+			!row.NextAttemptAt.Equal(fixedNoticeTime.Add(retryDelays[attempt-1])) {
+			t.Fatalf("attempt %d: state=%s next=%v", attempt, row.State, row.NextAttemptAt)
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("no notice while still retrying, got %d", len(*sent))
+	}
+	last := busyRow(t, "busy-6", len(retryDelays)+1)
+	p.failInbox(&last, busy, fixedNoticeTime)
+	db.First(&last, last.ID)
+	if last.State != inboxDead || last.LastErrorCode != "im_conversation_busy" {
+		t.Fatalf("6th busy: state=%s code=%s", last.State, last.LastErrorCode)
+	}
+	again := busyRow(t, "busy-7", len(retryDelays)+1)
+	p.failInbox(&again, busy, fixedNoticeTime)
+	if got := noticeTexts(t, *sent); len(got) != 1 || got[0] != busyTimeoutText || (*sent)[0].FromUID != "42" {
+		t.Fatalf("timeout notices=%v", got)
+	}
+}
+
+func TestOtherConflictStaysTerminalAndSilent(t *testing.T) {
+	db := m2DB(t)
+	sent, _ := noticeServer(t, false)
+	row := busyRow(t, "conflict", 1)
+	(&Plugin{}).failInbox(&row, &httpStatusError{status: http.StatusConflict, code: "im_source_key_conflict"}, fixedNoticeTime)
+	db.First(&row, row.ID)
+	if row.State != inboxDead || row.NextAttemptAt != nil || len(*sent) != 0 {
+		t.Fatalf("other 409: state=%s next=%v notices=%d", row.State, row.NextAttemptAt, len(*sent))
+	}
+}
