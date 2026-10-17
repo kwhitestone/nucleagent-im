@@ -2,10 +2,12 @@ package im
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -81,7 +83,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 			return false, nil
 		}
 		if message.MsgType == "error" {
-			if err := markTerminalFailure(row.ID, "im_execution_failed"); err != nil {
+			if err := p.failExecution(ctx, row, message.ID); err != nil {
 				return false, err
 			}
 			if err := persistCoreEventID(row, id); err != nil {
@@ -162,6 +164,41 @@ func markTerminalFailure(id uint, code string) error {
 		"state": inboxDead, "last_error_code": code, "lease_owner": "",
 		"lease_expires_at": nil, "next_attempt_at": nil,
 	}).Error
+}
+
+// IM-AGENT-FAILURE-NOTICE: a failed run leaves one durable system line, so the
+// question is not left unanswered once the 2-minute live replay is over. The
+// upstream error text never reaches the chat.
+const (
+	execFailedNotice = "execution_failed"
+	execFailedText   = "智能体这次没能完成回答，请稍后重试"
+)
+
+// failExecution marks the turn dead and posts its notice once per failure: only
+// the call that moves the row out of processing sends, and the client_msg_no is
+// stored on the row so the browser stream can hand its live error line over to
+// the durable notice. Not replyNotice: its 10-minute window would swallow the
+// notice for a retry that fails again, and its code renders as "agent disabled".
+func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMessageID uint) error {
+	clientNo := deterministicClientMessageNo(row.SourceKey, coreMessageID)
+	result := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ? AND state = ?", row.ID, inboxProcessing).Updates(map[string]any{
+		"state": inboxDead, "last_error_code": "im_execution_failed", "lease_owner": "",
+		"lease_expires_at": nil, "next_attempt_at": nil, "final_wu_kong_client_msg_no": clientNo,
+	})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return result.Error
+	}
+	row.FinalWuKongClientMsgNo = clientNo
+	payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: execFailedText, SystemNotice: execFailedNotice})
+	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
+		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
+		"channel_id": row.ChannelID, "channel_type": row.ChannelType, "client_msg_no": clientNo,
+		"payload": base64.StdEncoding.EncodeToString(payload),
+	}, nil); err != nil {
+		// The turn is over either way; the live error line still shows for 2 minutes.
+		slog.Warn("im execution failure notice failed", "agent_uid", row.TargetAgentUID, "channel_type", row.ChannelType, "error", err)
+	}
+	return nil
 }
 
 type agentStreamInput struct {
@@ -284,6 +321,8 @@ func (p *Plugin) sendAgentSnapshots(ctx context.Context, writer io.Writer, flush
 			writeAgentEvent(writer, flusher, rows[i], "error", map[string]any{
 				"sourceKey": rows[i].SourceKey, "code": "im_execution_failed",
 				"message": "The agent could not complete this request.",
+				// Set only for an execution failure: the durable notice that replaces this line.
+				"clientMsgNo": rows[i].FinalWuKongClientMsgNo,
 			})
 			seen[rows[i].ID] = signature
 			continue

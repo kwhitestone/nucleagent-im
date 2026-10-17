@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"errors"
 	"fmt"
 	"net/http"
@@ -477,7 +478,7 @@ func TestCoreStreamRetriesFinalEventAfterWuKongFailure(t *testing.T) {
 	}
 }
 
-func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
+func TestTerminalFailureSendsOnlyTheFixedNotice(t *testing.T) {
 	db := m2DB(t)
 	addUser(t, db, 1, authmodel.AccountTypeHuman)
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
@@ -491,8 +492,17 @@ func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sends atomic.Int32
+	var leaked atomic.Bool
 	wuKong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sends.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		var send struct{ Payload []byte }
+		_ = json.Unmarshal(body, &send)
+		var payload textPayload
+		_ = json.Unmarshal(send.Payload, &payload)
+		// The only message is the fixed system notice, never Core's error text.
+		leaked.Store(payload.SystemNotice != execFailedNotice || payload.Content != execFailedText ||
+			strings.Contains(string(send.Payload), "secret"))
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer wuKong.Close()
@@ -511,8 +521,8 @@ func TestTerminalFailureDoesNotSendAgentMessage(t *testing.T) {
 	if err := db.First(&row, row.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.State != inboxDead || row.LastErrorCode != "im_execution_failed" || sends.Load() != 0 {
-		t.Fatalf("row=%+v sends=%d", row, sends.Load())
+	if row.State != inboxDead || row.LastErrorCode != "im_execution_failed" || sends.Load() != 1 || leaked.Load() {
+		t.Fatalf("row=%+v sends=%d leaked=%v", row, sends.Load(), leaked.Load())
 	}
 }
 
