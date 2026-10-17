@@ -11,7 +11,7 @@ if [[ ! -f "$localdir/ready-tombstone" ]]; then
   for spec in \
     "prism-fusion a32f03b296121ef3fc7f9d257ab3a0935f2008b6" \
     "nucleagent-shared $shared_revision" \
-    "nucleagent-storage 18d943b20005b7a351f96e8175e9c3e5ab2079b6" \
+    "nucleagent-storage 3b2c99d82c379f2a234eb42613dacc292d81b708" \
     "nucleagent-storage-ndcs 0ff0b4733f13c12d175fbfe8c2ce1a2752d0002c"; do
     read -r name revision <<< "$spec"
     mkdir -p "$localdir/$name"

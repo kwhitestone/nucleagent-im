@@ -16,7 +16,7 @@
     "name": "nucleagent-storage",
     "module": "github.com/kwhitestone/nucleagent-storage",
     "path": "app/src/server",
-    "commit": "18d943b20005b7a351f96e8175e9c3e5ab2079b6"
+    "commit": "3b2c99d82c379f2a234eb42613dacc292d81b708"
   },
   {
     "name": "nucleagent-storage-ndcs",
