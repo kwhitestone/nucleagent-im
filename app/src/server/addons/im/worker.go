@@ -166,6 +166,16 @@ func leaseInboxExcluding(ctx context.Context, db *gorm.DB, worker string, now ti
 			query = query.Where("NOT (channel_id = ? AND channel_type = ? AND target_agent_uid = ? AND execution_owner_user_id = ?)",
 				key.channelID, key.channelType, key.agentUID, key.ownerUID)
 		}
+		// A conversation's turns run in order on every instance: a turn is never
+		// leased while an earlier turn of the same conversation is still open
+		// (pending, waiting on a retry, or processing anywhere). This also keeps a
+		// later turn from overtaking an earlier one that is in busy-retry backoff.
+		query = query.Where("NOT EXISTS (SELECT 1 FROM im_webhook_inbox AS earlier WHERE "+
+			"earlier.channel_id = im_webhook_inbox.channel_id AND earlier.channel_type = im_webhook_inbox.channel_type AND "+
+			"earlier.target_agent_uid = im_webhook_inbox.target_agent_uid AND "+
+			"earlier.execution_owner_user_id = im_webhook_inbox.execution_owner_user_id AND "+
+			"earlier.id < im_webhook_inbox.id AND earlier.state IN ?)",
+			[]string{inboxPending, inboxRetryable, inboxProcessing})
 		query = query.Order("id ASC")
 		if tx.Dialector.Name() != "sqlite" {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})

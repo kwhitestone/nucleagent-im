@@ -243,3 +243,64 @@ func TestInboxWorkerSlotsBoundConcurrency(t *testing.T) {
 	cancel()
 	<-p.done
 }
+
+// All slots held by waiting turns: a new conversation's turn stays pending (not
+// lost, not failed) and runs as soon as one slot frees.
+func TestSaturatedSlotsQueueThenRun(t *testing.T) {
+	previous := inboxWorkerSlots
+	inboxWorkerSlots = 2
+	t.Cleanup(func() { inboxWorkerSlots = previous })
+	db := concurrencyDB(t)
+	addUser(t, db, 42, authmodel.AccountTypeAgent)
+	gates := map[string]chan struct{}{"s0": make(chan struct{}), "s1": make(chan struct{})}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
+		switch r.URL.Path {
+		case "/channel/messagesync":
+			fmt.Fprint(w, `{"messages":[]}`)
+		case "/message/send":
+		case "/api/v1/addons/conversation/im-dispatch":
+			var input dispatchRequest
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			if gate, ok := gates[input.SourceKey]; ok {
+				select {
+				case <-gate:
+				case <-r.Context().Done():
+				}
+				w.WriteHeader(http.StatusServiceUnavailable) // ends the turn retryable
+				return
+			}
+			_ = json.NewEncoder(w).Encode(dispatchResult{ConversationID: 30, SourceKey: input.SourceKey, Status: "accepted"})
+		case "/api/v1/addons/conversation/30/messages/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			emitCoreMessage(w, 1, "user", "text", "q", "new")
+			emitCoreMessage(w, 2, "agent", "result", "new answer", "")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	for i, src := range []string{"s0", "s1"} {
+		uid := uint(200 + i)
+		addUser(t, db, uid, authmodel.AccountTypeHuman)
+		pendingRow(t, db, src, fmt.Sprintf("%d@42", uid), uid)
+	}
+	addUser(t, db, 300, authmodel.AccountTypeHuman)
+	p := &Plugin{apiAddr: server.URL, coreURL: server.URL, serviceJWT: "test-token", done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(t.Context())
+	go p.runWorker(ctx)
+	t.Cleanup(func() { cancel(); <-p.done })
+	time.Sleep(300 * time.Millisecond) // both slots now held
+	fresh := pendingRow(t, db, "new", "300@42", 300)
+	time.Sleep(400 * time.Millisecond)
+	var queued IMWebhookInbox
+	db.First(&queued, fresh.ID)
+	if queued.State != inboxPending {
+		t.Fatalf("with all slots held the new turn is %s, want pending", queued.State)
+	}
+	close(gates["s0"])
+	waitState(t, db, fresh.ID, inboxCompleted, 3*time.Second)
+	close(gates["s1"])
+}
