@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -76,21 +77,69 @@ type historyTurn struct {
 	Content     string `json:"content"`
 }
 
+// inboxWorkerSlots bounds how many turns one IM instance runs at once. A long
+// turn (or a delegated turn waiting for its continuation) used to hold the only
+// worker, so every other channel on the instance queued behind it (MUYU-160).
+var inboxWorkerSlots = 8
+
+// inboxTurnKey is the per-conversation serial lock: one IM conversation (channel,
+// agent, owner) never has two turns in flight on this instance, so its turns keep
+// their order while other conversations proceed in parallel.
+type inboxTurnKey struct {
+	channelID   string
+	channelType uint8
+	agentUID    uint
+	ownerUID    uint
+}
+
+func turnKeyOf(row *IMWebhookInbox) inboxTurnKey {
+	return inboxTurnKey{row.ChannelID, row.ChannelType, row.TargetAgentUID, row.ExecutionOwnerUserID}
+}
+
 func (p *Plugin) runWorker(ctx context.Context) {
 	defer close(p.done)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	var (
+		mu       sync.Mutex
+		inFlight = map[inboxTurnKey]bool{}
+		turns    sync.WaitGroup
+	)
+	slots := make(chan struct{}, max(inboxWorkerSlots, 1))
+	defer turns.Wait() // shutdown lets running turns finish their own cancellation
 	for {
-		row, err := leaseInbox(ctx, global.PRISM_DB, p.workerID(), time.Now())
-		if err == nil && row != nil {
-			p.processLeased(ctx, row)
-			continue
-		}
 		select {
+		case slots <- struct{}{}:
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
 		}
+		mu.Lock()
+		busy := make([]inboxTurnKey, 0, len(inFlight))
+		for key := range inFlight {
+			busy = append(busy, key)
+		}
+		mu.Unlock()
+		row, err := leaseInboxExcluding(ctx, global.PRISM_DB, p.workerID(), time.Now(), busy)
+		if err != nil || row == nil {
+			<-slots
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+		key := turnKeyOf(row)
+		mu.Lock()
+		inFlight[key] = true
+		mu.Unlock()
+		turns.Add(1)
+		go func() {
+			defer turns.Done()
+			defer func() { <-slots }()
+			defer func() { mu.Lock(); delete(inFlight, key); mu.Unlock() }()
+			p.processLeased(ctx, row)
+		}()
 	}
 }
 
@@ -100,13 +149,24 @@ func (p *Plugin) workerID() string {
 }
 
 func leaseInbox(ctx context.Context, db *gorm.DB, worker string, now time.Time) (*IMWebhookInbox, error) {
+	return leaseInboxExcluding(ctx, db, worker, now, nil)
+}
+
+// leaseInboxExcluding leases the oldest due row whose conversation has no turn
+// in flight on this instance, so a busy conversation never blocks the others.
+func leaseInboxExcluding(ctx context.Context, db *gorm.DB, worker string, now time.Time, busy []inboxTurnKey) (*IMWebhookInbox, error) {
 	var leased IMWebhookInbox
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		query := tx.Where(
 			"(state IN ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR "+
 				"(state = ? AND lease_expires_at < ?)",
 			[]string{inboxPending, inboxRetryable}, now, inboxProcessing, now,
-		).Order("id ASC")
+		)
+		for _, key := range busy {
+			query = query.Where("NOT (channel_id = ? AND channel_type = ? AND target_agent_uid = ? AND execution_owner_user_id = ?)",
+				key.channelID, key.channelType, key.agentUID, key.ownerUID)
+		}
+		query = query.Order("id ASC")
 		if tx.Dialector.Name() != "sqlite" {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
 		}
