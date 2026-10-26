@@ -167,8 +167,9 @@ func TestLongRequestFailureNoticeGivesUpAfterSchedule(t *testing.T) {
 		p.resendDueNotices(t.Context(), at)
 	}
 	got := reloadRow(t, db, row.ID)
-	if got.State != inboxDead || got.NoticeDueAt != nil || sends["failed"] != len(noticeRetryDelays)+1 {
-		t.Fatalf("row=%+v sends=%v, want %d tries then dropped", got, sends, len(noticeRetryDelays)+1)
+	if got.State != inboxDead || got.NoticeDueAt != nil || got.NoticeSentAt != nil ||
+		got.NoticeAttempts != len(noticeRetryDelays) || sends["failed"] != len(noticeRetryDelays) {
+		t.Fatalf("row=%+v sends=%v, want %d tries then abandoned", got, sends, len(noticeRetryDelays))
 	}
 }
 

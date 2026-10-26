@@ -44,6 +44,14 @@ type IMWebhookInbox struct {
 	// NULL means no notice is owed. Additive column, AutoMigrate adds it.
 	NoticeDueAt    *time.Time `gorm:"index"`
 	NoticeAttempts int        `gorm:"not null;default:0"`
+	// NoticeSentAt marks the owed notice as accepted by WuKong; a dead turn with
+	// notice_attempts set, no due time and no sent time gave up (logged).
+	NoticeSentAt *time.Time
+	// DelegationStarted and ContinuationDueAt survive reconnects and restarts:
+	// once a run started a delegate_task, an empty result waits for the
+	// continuation answer until ContinuationDueAt, then the turn fails.
+	DelegationStarted bool `gorm:"not null;default:false"`
+	ContinuationDueAt *time.Time
 	// M3 A2A provenance (additive). ChainID identifies the origin chain that this
 	// row belongs to, ChainDepth is 1 for a human-originated trigger and +1 per
 	// agent hop, and OriginSenderUID is the human who started the chain — agent

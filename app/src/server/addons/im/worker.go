@@ -80,12 +80,7 @@ func (p *Plugin) runWorker(ctx context.Context) {
 	defer close(p.done)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	var lastNoticeSweep time.Time
 	for {
-		if now := time.Now(); now.Sub(lastNoticeSweep) >= 5*time.Second {
-			lastNoticeSweep = now
-			p.resendDueNotices(ctx, now)
-		}
 		row, err := leaseInbox(ctx, global.PRISM_DB, p.workerID(), time.Now())
 		if err == nil && row != nil {
 			p.processLeased(ctx, row)
