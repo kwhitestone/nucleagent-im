@@ -345,10 +345,13 @@ func (p *Plugin) endTurnWithFailure(ctx context.Context, row *IMWebhookInbox, co
 // Resend schedule for an owed failure notice. Each claim moves notice_due_at to
 // the next step BEFORE sending, so a send that fails or a process that dies in
 // between leaves the notice due again later — never cleared. Only WuKong's
-// acceptance clears it; after the schedule (about 3h) one final claim gives up.
+// acceptance clears it. After the fast schedule it retries every noticeSlowRetry.
 var noticeRetryDelays = []time.Duration{
 	5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute, 2 * time.Hour,
 }
+
+// noticeSlowRetry is the retry period once the fast schedule is used up.
+var noticeSlowRetry = 6 * time.Hour
 
 // deliverNotice claims the current due slot (so two senders never send the same
 // attempt), sends with the turn's deterministic client number (WuKong dedups a
@@ -360,20 +363,21 @@ func (p *Plugin) deliverNotice(ctx context.Context, row *IMWebhookInbox, now tim
 		current.FinalWuKongClientMsgNo == "" || now.Before(*current.NoticeDueAt) {
 		return
 	}
-	if current.NoticeAttempts >= len(noticeRetryDelays) {
-		// Schedule exhausted: the last attempt's outcome is past and unconfirmed.
-		global.PRISM_DB.Model(&IMWebhookInbox{}).
-			Where("id = ? AND notice_attempts = ? AND notice_due_at IS NOT NULL", current.ID, current.NoticeAttempts).
-			Update("notice_due_at", nil)
-		slog.Error("im execution failure notice abandoned after retries", "inbox_id", current.ID,
-			"agent_uid", row.TargetAgentUID, "attempts", current.NoticeAttempts)
-		return
+	// The notice is never dropped (MUYU-160 review 3): past the fast schedule it
+	// keeps being retried at noticeSlowRetry until WuKong accepts it, so a long
+	// WuKong outage only delays it. The ERROR log marks a notice that is overdue.
+	next := noticeSlowRetry
+	if current.NoticeAttempts < len(noticeRetryDelays) {
+		next = noticeRetryDelays[current.NoticeAttempts]
+	} else if current.NoticeAttempts == len(noticeRetryDelays) {
+		slog.Error("im execution failure notice still undelivered after fast retries; continuing slow retries",
+			"inbox_id", current.ID, "agent_uid", row.TargetAgentUID, "attempts", current.NoticeAttempts)
 	}
 	claim := global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND notice_attempts = ? AND notice_due_at IS NOT NULL", current.ID, current.NoticeAttempts).
 		Updates(map[string]any{
 			"notice_attempts": gorm.Expr("notice_attempts + 1"),
-			"notice_due_at":   now.Add(noticeRetryDelays[current.NoticeAttempts]),
+			"notice_due_at":   now.Add(next),
 		})
 	if claim.Error != nil || claim.RowsAffected != 1 {
 		return

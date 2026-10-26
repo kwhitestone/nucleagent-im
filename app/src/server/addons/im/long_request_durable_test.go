@@ -13,9 +13,9 @@ import (
 // a reconnect, a restart, a cursor that moved on, or a process that dies
 // between claim and send must not lose a reply or leave a turn processing.
 
-// The last scheduled attempt fails: the notice is not cleared at claim time, so
-// it is still owed, and only a later sweep past the schedule abandons it.
-func TestNoticeLastAttemptFailureStaysOwedUntilAbandoned(t *testing.T) {
+// The fast schedule runs out while WuKong is down: the notice is never dropped.
+// It stays owed on a slow retry and is delivered once WuKong is back, exactly once.
+func TestNoticeOutlivesFastScheduleAndIsDelivered(t *testing.T) {
 	p, db, _ := longRequestFixture(t)
 	var failing atomic.Bool
 	failing.Store(true)
@@ -25,28 +25,33 @@ func TestNoticeLastAttemptFailureStaysOwedUntilAbandoned(t *testing.T) {
 	row.Attempts = len(retryDelays) + 1
 	p.failInbox(row, errCoreStreamIdle, time.Now())
 	at := time.Now()
-	for range len(noticeRetryDelays) - 1 {
-		at = at.Add(3 * time.Hour)
+	for range len(noticeRetryDelays) + 2 { // past the fast schedule
+		at = at.Add(noticeSlowRetry + time.Minute)
 		p.resendDueNotices(t.Context(), at)
 	}
 	got := reloadRow(t, db, row.ID)
-	if got.NoticeAttempts != len(noticeRetryDelays) || got.NoticeDueAt == nil || got.NoticeSentAt != nil {
-		t.Fatalf("after the last failed attempt: %+v, want still owed", got)
+	if got.NoticeDueAt == nil || got.NoticeSentAt != nil || got.NoticeAttempts <= len(noticeRetryDelays) {
+		t.Fatalf("after the fast schedule: %+v, want still owed on slow retry", got)
 	}
-	// WuKong recovers before the final sweep: the notice is not lost after all.
+	if want := at.Add(noticeSlowRetry); got.NoticeDueAt.Sub(want).Abs() > time.Second {
+		t.Fatalf("slow retry due=%v, want %v", got.NoticeDueAt, want)
+	}
 	failing.Store(false)
-	p.resendDueNotices(t.Context(), at.Add(3*time.Hour))
+	p.resendDueNotices(t.Context(), at.Add(noticeSlowRetry+time.Minute))
 	got = reloadRow(t, db, row.ID)
-	if got.NoticeDueAt != nil || got.NoticeSentAt != nil || sends["ok"] != 0 {
-		t.Fatalf("past schedule must abandon (logged), not send: %+v sends=%v", got, sends)
+	if sends["ok"] != 1 || got.NoticeSentAt == nil || got.NoticeDueAt != nil {
+		t.Fatalf("row=%+v sends=%v, want delivered once after the outage", got, sends)
+	}
+	p.resendDueNotices(t.Context(), at.Add(48*time.Hour))
+	if sends["ok"] != 1 {
+		t.Fatalf("delivered notice resent: %v", sends)
 	}
 }
 
 // The process dies after claiming an attempt and before WuKong answers
 // (modelled by a cancelled context): the claim already moved the notice to its
 // next due time instead of clearing it, so a later sweep still delivers it.
-// Regression guard; the last-attempt clearing bug itself is pinned by
-// TestNoticeLastAttemptFailureStaysOwedUntilAbandoned.
+// Regression guard for the claim-then-crash window.
 func TestNoticeInterruptedSendIsResent(t *testing.T) {
 	p, db, _ := longRequestFixture(t)
 	var failing atomic.Bool
@@ -232,5 +237,49 @@ func TestDelegationSurvivesMoreThan64ToolRows(t *testing.T) {
 	sent := core.notices()
 	if len(sent) != 1 || sentPayload(t, sent[0]).Content != "delegated answer" {
 		t.Fatalf("sent=%+v, want only the continuation answer (empty result not taken as the reply)", sent)
+	}
+}
+
+// A delegated turn timed out in IM and its continuation answer lands in Core
+// late. That answer belongs to the timed-out turn (Core keeps it); the user's
+// next question gets its own answer, never the late one.
+func TestLateContinuationAnswerNotGivenToFollowUp(t *testing.T) {
+	previous := coreContinuationWait
+	coreContinuationWait = 100 * time.Millisecond
+	t.Cleanup(func() { coreContinuationWait = previous })
+	p, db, core := longRequestFixture(t)
+	var calls atomic.Int32
+	core.turns["/api/v1/addons/conversation/9/messages/stream"] = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		emitCoreMessage(w, 7, "user", "text", "q", "slow-turn")
+		emitCoreTool(w, 8, "delegate_task", "completed")
+		emitCoreMessage(w, 9, "agent", "result", "", "")
+		if calls.Add(1) == 1 {
+			time.Sleep(300 * time.Millisecond) // continuation not here before the IM deadline
+			return
+		}
+		emitCoreMessage(w, 11, "agent", "result", "late delegated answer", "") // after the IM timeout
+		emitCoreMessage(w, 12, "user", "text", "next", "next-turn")
+		emitCoreMessage(w, 13, "agent", "result", "next answer", "")
+	}
+	first := longRequestRow(t, db, "slow-turn", 9)
+	if err := p.consumeCoreStream(t.Context(), first); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if got := reloadRow(t, db, first.ID); got.State != inboxDead || got.LastErrorCode != "im_continuation_timeout" {
+		t.Fatalf("first=%+v", got)
+	}
+	next := longRequestRow(t, db, "next-turn", 9)
+	if err := p.consumeCoreStream(t.Context(), next); err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	got := reloadRow(t, db, next.ID)
+	if got.State != inboxCompleted || got.CumulativeAnswer != "next answer" {
+		t.Fatalf("next=%+v, want its own answer", got)
+	}
+	for _, s := range core.notices() {
+		if sentPayload(t, s).Content == "late delegated answer" {
+			t.Fatalf("late answer was delivered to the follow-up: %+v", core.notices())
+		}
 	}
 }

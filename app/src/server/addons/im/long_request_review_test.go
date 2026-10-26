@@ -150,8 +150,8 @@ func TestLongRequestFailureNoticeResentAfterSendError(t *testing.T) {
 	}
 }
 
-// The resend schedule ends: after the last step the debt is dropped instead of
-// retrying forever, and the turn stays dead.
+// The fast resend schedule ends without dropping the notice: it stays owed and
+// moves to the slow retry, and the turn stays dead.
 func TestLongRequestFailureNoticeGivesUpAfterSchedule(t *testing.T) {
 	p, db, _ := longRequestFixture(t)
 	var failing atomic.Bool
@@ -163,13 +163,15 @@ func TestLongRequestFailureNoticeGivesUpAfterSchedule(t *testing.T) {
 	p.failInbox(row, errCoreStreamIdle, time.Now())
 	at := time.Now()
 	for range len(noticeRetryDelays) + 3 {
-		at = at.Add(time.Hour)
+		at = at.Add(noticeSlowRetry + time.Minute)
 		p.resendDueNotices(t.Context(), at)
 	}
 	got := reloadRow(t, db, row.ID)
-	if got.State != inboxDead || got.NoticeDueAt != nil || got.NoticeSentAt != nil ||
-		got.NoticeAttempts != len(noticeRetryDelays) || sends["failed"] != len(noticeRetryDelays) {
-		t.Fatalf("row=%+v sends=%v, want %d tries then abandoned", got, sends, len(noticeRetryDelays))
+	// failInbox makes the first attempt itself, then one per sweep.
+	want := 1 + len(noticeRetryDelays) + 3
+	if got.State != inboxDead || got.NoticeDueAt == nil || got.NoticeSentAt != nil ||
+		got.NoticeAttempts != want || sends["failed"] != want {
+		t.Fatalf("row=%+v sends=%v, want still owed after %d failed tries", got, sends, want)
 	}
 }
 
