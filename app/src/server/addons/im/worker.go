@@ -367,8 +367,33 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		updates["state"] = inboxRetryable
 		updates["next_attempt_at"] = now.Add(retryDelays[row.Attempts-1])
 	}
-	global.PRISM_DB.Model(&IMWebhookInbox{}).
+	// MUYU-160: a turn that ran out of retries on an infrastructure failure (Core
+	// stream dropped or idle, 5xx) used to go dead with no reply at all.
+	// A stopped or deleted agent keeps its own notice below. The client number is
+	// recorded only when this notice is really sent: the browser hands its live
+	// error line over to the durable message that carries it.
+	exhausted := retryable && updates["state"] == inboxDead && code != conversationBusyCode
+	if exhausted {
+		if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {
+			exhausted = false
+		}
+	}
+	exhaustedClientNo := ""
+	if exhausted {
+		// Core message IDs start at 1, so 0 never collides with a reply's number.
+		exhaustedClientNo = deterministicClientMessageNo(row.SourceKey, 0)
+		updates["final_wu_kong_client_msg_no"] = exhaustedClientNo
+	}
+	result := global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
+	if exhausted {
+		// Only the call that moved this lease's row posts; a stale holder does not.
+		if result.Error == nil && result.RowsAffected == 1 {
+			row.FinalWuKongClientMsgNo = exhaustedClientNo
+			p.postExecutionFailedNotice(context.Background(), row, exhaustedClientNo)
+		}
+		return
+	}
 	if updates["state"] == inboxDead && code == conversationBusyCode {
 		// ponytail: retry order is not first-come-first-served; a per-(group,agent,owner) lease is P1.
 		replyNotice(context.Background(), global.PRISM_DB, busyTimeoutScope, busyTimeoutText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)

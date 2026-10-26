@@ -45,9 +45,18 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 	if row.LastCoreEventID != "" {
 		request.Header.Set("Last-Event-ID", row.LastCoreEventID)
 	}
+	// MUYU-160: a half-open Core stream used to hang this turn forever while the
+	// lease kept renewing, so the row stayed processing and the turn never ended.
+	// Core pings every 15s; silence past the idle limit drops the stream and the
+	// retry resumes from the persisted Last-Event-ID.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	request = request.WithContext(streamCtx)
+	idle := time.AfterFunc(coreStreamIdleTimeout, cancelStream)
+	defer idle.Stop()
 	response, err := (&http.Client{}).Do(request)
 	if err != nil {
-		return err
+		return coreStreamError(ctx, streamCtx, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
@@ -55,7 +64,8 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		return &httpStatusError{status: response.StatusCode, code: "core_stream_http_" + strconv.Itoa(response.StatusCode)}
 	}
 	completed := false
-	err = scanSSE(response.Body, func(event, id string, data []byte) (bool, error) {
+	body := &idleResetReader{reader: response.Body, timer: idle, limit: coreStreamIdleTimeout}
+	err = scanSSE(body, func(event, id string, data []byte) (bool, error) {
 		if event != "message-created" && event != "message-updated" {
 			return false, persistCoreEventID(row, id)
 		}
@@ -117,12 +127,43 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		return false, persistCoreEventID(row, id)
 	})
 	if err != nil {
-		return err
+		return coreStreamError(ctx, streamCtx, err)
 	}
 	if !completed {
 		return errors.New("core stream ended before a terminal event")
 	}
 	return nil
+}
+
+// coreStreamIdleTimeout is how long the Core stream may stay silent before it is
+// treated as dead. Core sends a ": ping" every 15s, so this is several missed pings.
+var coreStreamIdleTimeout = 75 * time.Second
+
+var errCoreStreamIdle = errors.New("core stream idle timeout")
+
+// coreStreamError keeps worker shutdown distinct from an idle cutoff, so an idle
+// stream is a retryable failure while shutdown keeps its context error.
+func coreStreamError(parent, stream context.Context, err error) error {
+	if parent.Err() == nil && stream.Err() != nil {
+		return errCoreStreamIdle
+	}
+	return err
+}
+
+// idleResetReader pushes the idle deadline forward whenever Core sends bytes,
+// including the ": ping" heartbeat comments that scanSSE skips.
+type idleResetReader struct {
+	reader io.Reader
+	timer  *time.Timer
+	limit  time.Duration
+}
+
+func (r *idleResetReader) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		r.timer.Reset(r.limit)
+	}
+	return n, err
 }
 
 func persistCoreEventID(row *IMWebhookInbox, id string) error {
@@ -189,6 +230,11 @@ func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMes
 		return result.Error
 	}
 	row.FinalWuKongClientMsgNo = clientNo
+	p.postExecutionFailedNotice(ctx, row, clientNo)
+	return nil
+}
+
+func (p *Plugin) postExecutionFailedNotice(ctx context.Context, row *IMWebhookInbox, clientNo string) {
 	payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: execFailedText, SystemNotice: execFailedNotice})
 	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
 		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
@@ -198,7 +244,6 @@ func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMes
 		// The turn is over either way; the live error line still shows for 2 minutes.
 		slog.Warn("im execution failure notice failed", "agent_uid", row.TargetAgentUID, "channel_type", row.ChannelType, "error", err)
 	}
-	return nil
 }
 
 type agentStreamInput struct {
