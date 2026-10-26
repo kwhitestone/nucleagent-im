@@ -84,6 +84,15 @@ func emitCoreMessage(w http.ResponseWriter, id int, sender, kind, content, sourc
 	}
 }
 
+func emitCoreTool(w http.ResponseWriter, id int, tool, status string) {
+	data, _ := json.Marshal(map[string]any{"id": id, "senderType": "tool", "msgType": "tool_call", "content": tool,
+		"metadata": map[string]any{"tool": tool, "tool_status": status, "tool_call_id": fmt.Sprint("call-", id)}})
+	fmt.Fprintf(w, "id: %d\nevent: message-created\ndata: %s\n\n", id, data)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func reloadRow(t *testing.T, db *gorm.DB, id uint) IMWebhookInbox {
 	t.Helper()
 	var row IMWebhookInbox
@@ -101,9 +110,10 @@ func TestLongRequestEmptyResultWaitsForContinuation(t *testing.T) {
 	core.turns["/api/v1/addons/conversation/9/messages/stream"] = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		emitCoreMessage(w, 7, "user", "text", "q", "delegated-turn")
-		emitCoreMessage(w, 8, "agent", "result", "", "")
+		emitCoreTool(w, 8, "delegate_task", "completed")
+		emitCoreMessage(w, 9, "agent", "result", "", "")
 		fmt.Fprint(w, ": ping\n\n")
-		emitCoreMessage(w, 9, "agent", "result", "delegated answer", "")
+		emitCoreMessage(w, 10, "agent", "result", "delegated answer", "")
 	}
 	row := longRequestRow(t, db, "delegated-turn", 9)
 	if err := p.consumeCoreStream(t.Context(), row); err != nil {

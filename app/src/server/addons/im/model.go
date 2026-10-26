@@ -39,6 +39,11 @@ type IMWebhookInbox struct {
 	FinalCoreMessageID     uint
 	FinalWuKongClientMsgNo string `gorm:"size:128"`
 	FinalSentAt            *time.Time
+	// NoticeDueAt is set while the durable failure notice of a dead turn is not
+	// yet confirmed by WuKong; the worker resends it until it lands (MUYU-160).
+	// NULL means no notice is owed. Additive column, AutoMigrate adds it.
+	NoticeDueAt    *time.Time `gorm:"index"`
+	NoticeAttempts int        `gorm:"not null;default:0"`
 	// M3 A2A provenance (additive). ChainID identifies the origin chain that this
 	// row belongs to, ChainDepth is 1 for a human-originated trigger and +1 per
 	// agent hop, and OriginSenderUID is the human who started the chain — agent

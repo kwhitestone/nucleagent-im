@@ -19,11 +19,25 @@ import (
 )
 
 type coreMessage struct {
-	ID         uint   `json:"id"`
-	SenderType string `json:"senderType"`
-	MsgType    string `json:"msgType"`
-	Content    string `json:"content"`
-	SourceKey  string `json:"sourceKey"`
+	ID         uint            `json:"id"`
+	SenderType string          `json:"senderType"`
+	MsgType    string          `json:"msgType"`
+	Content    string          `json:"content"`
+	SourceKey  string          `json:"sourceKey"`
+	Metadata   json.RawMessage `json:"metadata"`
+}
+
+// startedDelegation reports a delegate_task call that Core accepted: the run
+// then ends without the answer, which arrives later in a continuation run.
+func (m coreMessage) startedDelegation() bool {
+	if m.MsgType != "tool_call" || len(m.Metadata) == 0 {
+		return false
+	}
+	var meta struct {
+		Tool   string `json:"tool"`
+		Status string `json:"tool_status"`
+	}
+	return json.Unmarshal(m.Metadata, &meta) == nil && meta.Tool == "delegate_task" && meta.Status == "completed"
 }
 
 func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) error {
@@ -54,6 +68,15 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 	request = request.WithContext(streamCtx)
 	idle := time.AfterFunc(coreStreamIdleTimeout, cancelStream)
 	defer idle.Stop()
+	// Set when a delegated run ended empty and the continuation answer did not
+	// arrive in time; Core pings keep the stream alive, so this bounds the wait.
+	continuationExpired := make(chan struct{})
+	var continuation *time.Timer
+	defer func() {
+		if continuation != nil {
+			continuation.Stop()
+		}
+	}()
 	response, err := (&http.Client{}).Do(request)
 	if err != nil {
 		return coreStreamError(ctx, streamCtx, err)
@@ -64,6 +87,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		return &httpStatusError{status: response.StatusCode, code: "core_stream_http_" + strconv.Itoa(response.StatusCode)}
 	}
 	completed := false
+	delegated := false
 	body := &idleResetReader{reader: response.Body, timer: idle, limit: coreStreamIdleTimeout}
 	err = scanSSE(body, func(event, id string, data []byte) (bool, error) {
 		if event != "message-created" && event != "message-updated" {
@@ -102,6 +126,10 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 			completed = true
 			return true, nil
 		}
+		if message.startedDelegation() {
+			// Core replays tool rows on a resume, so this is rebuilt after a retry.
+			delegated = true
+		}
 		if message.SenderType != "agent" {
 			return false, persistCoreEventID(row, id)
 		}
@@ -113,6 +141,31 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 			if err := persistSnapshot(row, message.Content); err != nil {
 				return false, err
 			}
+		case event == "message-created" && message.MsgType == "result" && strings.TrimSpace(message.Content) == "":
+			// Core finalizes every successful run with a result row, even one
+			// with no text (MUYU-160). Without a delegation that row is the end
+			// of the turn; ignoring it left the turn processing forever while
+			// Core's pings kept the stream alive.
+			if !delegated {
+				if err := p.sendFinal(ctx, row, message.ID, emptyResultText); err != nil {
+					return false, err
+				}
+				if err := persistCoreEventID(row, id); err != nil {
+					return false, err
+				}
+				completed = true
+				return true, nil
+			}
+			// After a delegation the answer arrives in a continuation run. Wait
+			// for it, bounded. The cursor stays before this row so a resumed
+			// stream sees it again and restarts the same bounded wait.
+			if continuation == nil {
+				continuation = time.AfterFunc(coreContinuationWait, func() {
+					close(continuationExpired)
+					cancelStream()
+				})
+			}
+			return false, nil
 		case event == "message-created" && (message.MsgType == "text" || message.MsgType == "result") &&
 			strings.TrimSpace(message.Content) != "":
 			if err := p.sendFinal(ctx, row, message.ID, message.Content); err != nil {
@@ -126,6 +179,13 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		}
 		return false, persistCoreEventID(row, id)
 	})
+	select {
+	case <-continuationExpired:
+		if !completed {
+			return p.endTurnWithFailure(ctx, row, "im_continuation_timeout", deterministicClientMessageNo(row.SourceKey, 0))
+		}
+	default:
+	}
 	if err != nil {
 		return coreStreamError(ctx, streamCtx, err)
 	}
@@ -140,6 +200,14 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 var coreStreamIdleTimeout = 75 * time.Second
 
 var errCoreStreamIdle = errors.New("core stream idle timeout")
+
+// coreContinuationWait bounds how long a delegated turn that ended without text
+// waits for its continuation answer before it fails with a notice.
+var coreContinuationWait = 30 * time.Minute
+
+// emptyResultText answers a run that Core finished without any text, so the
+// question is never left without a reply.
+const emptyResultText = "智能体已完成处理，但没有返回文字内容。"
 
 // coreStreamError keeps worker shutdown distinct from an idle cutoff, so an idle
 // stream is a retryable failure while shutdown keeps its context error.
@@ -221,28 +289,78 @@ const (
 // the durable notice. Not replyNotice: its 10-minute window would swallow the
 // notice for a retry that fails again, and its code renders as "agent disabled".
 func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMessageID uint) error {
-	clientNo := deterministicClientMessageNo(row.SourceKey, coreMessageID)
+	return p.endTurnWithFailure(ctx, row, "im_execution_failed", deterministicClientMessageNo(row.SourceKey, coreMessageID))
+}
+
+// endTurnWithFailure moves a processing turn to dead and owes its durable
+// notice in the same write, so a WuKong outage can delay the notice but never
+// lose it (MUYU-160): deliverNotice and the worker's resend loop clear the debt
+// only once WuKong accepted the message.
+func (p *Plugin) endTurnWithFailure(ctx context.Context, row *IMWebhookInbox, code, clientNo string) error {
+	now := time.Now()
 	result := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ? AND state = ?", row.ID, inboxProcessing).Updates(map[string]any{
-		"state": inboxDead, "last_error_code": "im_execution_failed", "lease_owner": "",
+		"state": inboxDead, "last_error_code": code, "lease_owner": "",
 		"lease_expires_at": nil, "next_attempt_at": nil, "final_wu_kong_client_msg_no": clientNo,
+		"notice_due_at": now, "notice_attempts": 0,
 	})
 	if result.Error != nil || result.RowsAffected == 0 {
 		return result.Error
 	}
+	row.State = inboxDead
 	row.FinalWuKongClientMsgNo = clientNo
-	p.postExecutionFailedNotice(ctx, row, clientNo)
+	p.deliverNotice(ctx, row, now)
 	return nil
 }
 
-func (p *Plugin) postExecutionFailedNotice(ctx context.Context, row *IMWebhookInbox, clientNo string) {
+// Resend schedule for an owed failure notice; after the last step it is dropped.
+var noticeRetryDelays = []time.Duration{
+	5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute,
+}
+
+// deliverNotice claims the current due slot (so two workers never send the same
+// attempt), sends with the turn's deterministic client number, and clears the
+// debt on success. A failed send keeps it due at the next backoff step.
+func (p *Plugin) deliverNotice(ctx context.Context, row *IMWebhookInbox, now time.Time) {
+	var current IMWebhookInbox
+	if err := global.PRISM_DB.Select("id", "notice_due_at", "notice_attempts", "final_wu_kong_client_msg_no").
+		First(&current, row.ID).Error; err != nil || current.NoticeDueAt == nil || current.FinalWuKongClientMsgNo == "" {
+		return
+	}
+	updates := map[string]any{"notice_attempts": gorm.Expr("notice_attempts + 1"), "notice_due_at": nil}
+	if current.NoticeAttempts < len(noticeRetryDelays) {
+		updates["notice_due_at"] = now.Add(noticeRetryDelays[current.NoticeAttempts])
+	}
+	claim := global.PRISM_DB.Model(&IMWebhookInbox{}).
+		Where("id = ? AND notice_attempts = ? AND notice_due_at IS NOT NULL", current.ID, current.NoticeAttempts).Updates(updates)
+	if claim.Error != nil || claim.RowsAffected != 1 {
+		return
+	}
 	payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: execFailedText, SystemNotice: execFailedNotice})
 	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
 		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
-		"channel_id": row.ChannelID, "channel_type": row.ChannelType, "client_msg_no": clientNo,
+		"channel_id": row.ChannelID, "channel_type": row.ChannelType, "client_msg_no": current.FinalWuKongClientMsgNo,
 		"payload": base64.StdEncoding.EncodeToString(payload),
 	}, nil); err != nil {
-		// The turn is over either way; the live error line still shows for 2 minutes.
-		slog.Warn("im execution failure notice failed", "agent_uid", row.TargetAgentUID, "channel_type", row.ChannelType, "error", err)
+		// The turn stays over; the notice is still owed unless this was the last try.
+		slog.Warn("im execution failure notice failed", "agent_uid", row.TargetAgentUID, "channel_type", row.ChannelType,
+			"attempt", current.NoticeAttempts+1, "error", err)
+		return
+	}
+	global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", current.ID).Update("notice_due_at", nil)
+}
+
+// resendDueNotices retries owed failure notices whose backoff has passed.
+func (p *Plugin) resendDueNotices(ctx context.Context, now time.Time) {
+	var due []IMWebhookInbox
+	if err := global.PRISM_DB.WithContext(ctx).Where("state = ? AND notice_due_at IS NOT NULL AND notice_due_at <= ?", inboxDead, now).
+		Order("notice_due_at ASC").Limit(20).Find(&due).Error; err != nil {
+		return
+	}
+	for i := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		p.deliverNotice(ctx, &due[i], now)
 	}
 }
 

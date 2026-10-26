@@ -80,7 +80,12 @@ func (p *Plugin) runWorker(ctx context.Context) {
 	defer close(p.done)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	var lastNoticeSweep time.Time
 	for {
+		if now := time.Now(); now.Sub(lastNoticeSweep) >= 5*time.Second {
+			lastNoticeSweep = now
+			p.resendDueNotices(ctx, now)
+		}
 		row, err := leaseInbox(ctx, global.PRISM_DB, p.workerID(), time.Now())
 		if err == nil && row != nil {
 			p.processLeased(ctx, row)
@@ -383,6 +388,9 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		// Core message IDs start at 1, so 0 never collides with a reply's number.
 		exhaustedClientNo = deterministicClientMessageNo(row.SourceKey, 0)
 		updates["final_wu_kong_client_msg_no"] = exhaustedClientNo
+		// Owed in the same write that ends the turn, so a failed send is retried.
+		updates["notice_due_at"] = now
+		updates["notice_attempts"] = 0
 	}
 	result := global.PRISM_DB.Model(&IMWebhookInbox{}).
 		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
@@ -390,7 +398,7 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		// Only the call that moved this lease's row posts; a stale holder does not.
 		if result.Error == nil && result.RowsAffected == 1 {
 			row.FinalWuKongClientMsgNo = exhaustedClientNo
-			p.postExecutionFailedNotice(context.Background(), row, exhaustedClientNo)
+			p.deliverNotice(context.Background(), row, now)
 		}
 		return
 	}
