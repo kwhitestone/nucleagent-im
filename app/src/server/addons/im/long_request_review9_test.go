@@ -28,6 +28,25 @@ type dedupReceiver struct {
 	stored   []noticeSend
 	seen     map[string]bool
 	mode     atomic.Int32 // 0 ok, 1 reject 403 (not stored), 2 store but drop the response
+	// Pause barrier (optional, set before the first post): the first post is
+	// counted, then held before it is stored until release is closed. held is
+	// set once it is held.
+	release chan struct{}
+	held    atomic.Bool
+}
+
+// holdFirstPost makes the next first post wait inside the receiver, before it
+// is stored, until the returned release function is called.
+func (r *dedupReceiver) holdFirstPost() (release func()) {
+	r.release = make(chan struct{})
+	var once sync.Once
+	return func() { once.Do(func() { close(r.release) }) }
+}
+
+func (r *dedupReceiver) messages() []noticeSend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]noticeSend(nil), r.stored...)
 }
 
 func newDedupReceiver(t *testing.T) (*dedupReceiver, string) {
@@ -42,6 +61,13 @@ func newDedupReceiver(t *testing.T) (*dedupReceiver, string) {
 		_ = json.NewDecoder(req.Body).Decode(&body)
 		r.mu.Lock()
 		r.attempts++
+		first := r.attempts == 1
+		r.mu.Unlock()
+		if first && r.release != nil {
+			r.held.Store(true)
+			<-r.release // the first post is in flight, not yet stored
+		}
+		r.mu.Lock()
 		mode := r.mode.Load()
 		if mode == 1 {
 			r.mu.Unlock()

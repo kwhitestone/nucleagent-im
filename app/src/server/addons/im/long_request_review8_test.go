@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,53 +54,56 @@ func TestRefusedHolderPausedThenTakenOverCannotEndTurn(t *testing.T) {
 // post a failure notice for a turn whose answer is already claimed: it
 // delivers A's claimed answer, with the same client number A will post, so the
 // chat ends up with one answer and no contradictory failure line.
+//
+// Independent review (2026-10-27, P2): the posts go to dedupReceiver, which
+// holds A's post in flight (counted, not yet stored) while B takes over and
+// delivers; A's post lands after B's. Both POST attempts are counted, and the
+// receiver must hold exactly one message, the claimed answer.
 func TestPausedSenderAndTimedOutTakeoverPostOneOutcome(t *testing.T) {
-	p, db, _ := longRequestFixture(t)
-	release := make(chan struct{})
-	var held atomic.Bool
-	var mu sync.Mutex
-	var sent []noticeSend
-	p.apiAddr = wrapSendFunc(t, func(body noticeSend) {
-		if !held.Swap(true) {
-			<-release // the first sender (A) is paused right at the send
-		}
-		mu.Lock()
-		sent = append(sent, body)
-		mu.Unlock()
-	})
+	p, db, core := longRequestFixture(t)
+	receiver, url := newDedupReceiver(t)
+	p.apiAddr = url
+	release := receiver.holdFirstPost()
+	t.Cleanup(release) // never leave A's request hanging on a failed assertion
 	row := longRequestRow(t, db, "one-outcome", 9)
 	a := *row
 	doneA := make(chan error, 1)
 	go func() { doneA <- p.sendFinal(t.Context(), &a, 8, "the answer") }()
-	for !held.Load() {
+	for !receiver.held.Load() {
 		time.Sleep(5 * time.Millisecond)
 	}
-	// A is paused inside its send. Its lease expires, B takes over and gives up
-	// on the continuation.
+	// A is paused with its post in flight. Its lease expires, B takes over and
+	// gives up on the continuation: B delivers the claimed answer.
 	b := takeOver(t, row)
 	if err := p.endContinuationTimeout(t.Context(), &b); err != nil {
 		t.Fatalf("B: %v", err)
 	}
-	close(release)
+	if attempts, stored := receiver.counts(); attempts != 2 || stored != 1 {
+		t.Fatalf("before A resumes: attempts=%d stored=%d, want A in flight and B's post stored", attempts, stored)
+	}
+	release() // A's post now reaches the receiver, after B's
 	if err := <-doneA; !errors.Is(err, errLeaseLost) {
 		t.Fatalf("A after resume: %v, want errLeaseLost (B finished the turn)", err)
 	}
 	got := reloadRow(t, db, row.ID)
-	if got.State != inboxCompleted || got.CumulativeAnswer != "the answer" || got.NoticeDueAt != nil {
-		t.Fatalf("row=%+v, want completed with A's answer and no notice owed", got)
+	if got.State != inboxCompleted || got.CumulativeAnswer != "the answer" || got.NoticeDueAt != nil ||
+		got.LeaseOwner != "" || got.Attempts != b.Attempts {
+		t.Fatalf("row=%+v, want completed by B with A's answer and no notice owed", got)
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	attempts, stored := receiver.counts()
+	if attempts != 2 || stored != 1 {
+		t.Fatalf("attempts=%d stored=%d, want A's and B's posts counted and exactly 1 message stored", attempts, stored)
+	}
 	want := deterministicClientMessageNo("one-outcome", 8)
-	for _, s := range sent {
+	for _, s := range receiver.messages() {
 		var payload textPayload
 		_ = json.Unmarshal(s.Payload, &payload)
 		if s.ClientMsgNo != want || payload.Content != "the answer" || payload.SystemNotice != "" {
-			t.Fatalf("contradictory post %+v (%q): every post must be the one claimed answer", s, payload.Content)
+			t.Fatalf("stored %+v (%q): the one message must be the claimed answer, no failure notice", s, payload.Content)
 		}
 	}
-	if len(sent) != 2 {
-		t.Fatalf("sends=%d, want A's and B's identical posts", len(sent))
+	if n := len(core.notices()); n != 0 {
+		t.Fatalf("%d posts reached another receiver", n)
 	}
 }
 
