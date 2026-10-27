@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,6 +47,10 @@ func TestMultiProcessWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	global.PRISM_DB = db
+	// Diagnostics (MUYU-160 85 follow-up): every worker log line, debug level,
+	// goes to stderr, which the parent keeps and prints with the test output.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})).
+		With("worker", os.Getenv(mpNameEnv)))
 	core := os.Getenv(mpCoreEnv)
 	p := &Plugin{apiAddr: core, coreURL: core, serviceJWT: "test-token", done: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
@@ -209,6 +214,18 @@ func TestMultiProcessRestartTakeover(t *testing.T) {
 	}
 }
 
+// dumpInbox logs every inbox row's key state (diagnostics for a failed wait).
+func dumpInbox(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	var rows []IMWebhookInbox
+	db.Order("id").Find(&rows)
+	for _, r := range rows {
+		t.Logf("inbox id=%d source=%s state=%s owner=%s attempts=%d lease_expires=%v next=%v err=%s final_core=%d final_sent=%v core_stop=%q",
+			r.ID, r.SourceKey, r.State, r.LeaseOwner, r.Attempts, r.LeaseExpiresAt, r.NextAttemptAt, r.LastErrorCode,
+			r.FinalCoreMessageID, r.FinalSentAt, r.CoreStopCode)
+	}
+}
+
 func waitRow(t *testing.T, db *gorm.DB, id uint, ok func(IMWebhookInbox) bool, within time.Duration) IMWebhookInbox {
 	t.Helper()
 	deadline := time.Now().Add(within)
@@ -221,6 +238,7 @@ func waitRow(t *testing.T, db *gorm.DB, id uint, ok func(IMWebhookInbox) bool, w
 			return row
 		}
 		if time.Now().After(deadline) {
+			dumpInbox(t, db)
 			t.Fatalf("row %d not as expected after %v: %+v", id, within, row)
 		}
 		time.Sleep(200 * time.Millisecond)
