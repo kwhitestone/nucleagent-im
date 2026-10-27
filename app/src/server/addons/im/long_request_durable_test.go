@@ -22,7 +22,7 @@ func TestNoticeOutlivesFastScheduleAndIsDelivered(t *testing.T) {
 	sends := map[string]int{}
 	p.apiAddr = wrapSend(t, &failing, sends)
 	row := longRequestRow(t, db, "last-try", 9)
-	row.Attempts = len(retryDelays) + 1
+	exhaustRetries(t, db, row)
 	p.failInbox(row, errCoreStreamIdle, time.Now())
 	at := time.Now()
 	for range len(noticeRetryDelays) + 2 { // past the fast schedule

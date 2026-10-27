@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	authmodel "github.com/kwhitestone/prism-fusion/addons/auth/model"
 	"github.com/kwhitestone/prism-fusion/global"
 	"gorm.io/gorm"
 )
@@ -89,7 +90,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 	}()
 	if row.ContinuationDueAt != nil {
 		if !time.Now().Before(*row.ContinuationDueAt) {
-			return p.endTurnWithFailure(ctx, row, "im_continuation_timeout", deterministicClientMessageNo(row.SourceKey, 0))
+			return p.endContinuationTimeout(ctx, row)
 		}
 		armContinuation(*row.ContinuationDueAt)
 	}
@@ -120,8 +121,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		// separate because Core updates streaming messages in place at the same ID.
 		if row.DispatchCoreMessageID == 0 {
 			if message.SenderType == "user" && message.SourceKey == row.SourceKey {
-				if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).
-					Update("dispatch_core_message_id", message.ID).Error; err != nil {
+				if err := updateLeased(global.PRISM_DB, row, map[string]any{"dispatch_core_message_id": message.ID}); err != nil {
 					return false, err
 				}
 				row.DispatchCoreMessageID = message.ID
@@ -144,8 +144,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 		if message.startedDelegation() && !row.DelegationStarted {
 			// Persisted before the cursor moves past this row: Core replays at
 			// most 64 tool rows on a resume, so replay alone could lose it.
-			if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).
-				Update("delegation_started", true).Error; err != nil {
+			if err := updateLeased(global.PRISM_DB, row, map[string]any{"delegation_started": true}); err != nil {
 				return false, err
 			}
 			row.DelegationStarted = true
@@ -181,9 +180,11 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 			// wins), so the cursor may move on safely.
 			if row.ContinuationDueAt == nil {
 				due := time.Now().Add(coreContinuationWait)
-				if err := global.PRISM_DB.Model(&IMWebhookInbox{}).
-					Where("id = ? AND continuation_due_at IS NULL", row.ID).
+				if err := leaseScope(global.PRISM_DB, row).Where("continuation_due_at IS NULL").
 					Update("continuation_due_at", due).Error; err != nil {
+					return false, err
+				}
+				if err := verifyLease(global.PRISM_DB, row); err != nil {
 					return false, err
 				}
 				var stored IMWebhookInbox
@@ -212,7 +213,7 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 	select {
 	case <-continuationExpired:
 		if !completed {
-			return p.endTurnWithFailure(ctx, row, "im_continuation_timeout", deterministicClientMessageNo(row.SourceKey, 0))
+			return p.endContinuationTimeout(ctx, row)
 		}
 	default:
 	}
@@ -221,6 +222,60 @@ func (p *Plugin) consumeCoreStream(ctx context.Context, row *IMWebhookInbox) err
 	}
 	if !completed {
 		return errors.New("core stream ended before a terminal event")
+	}
+	return nil
+}
+
+// endContinuationTimeout ends a delegated turn whose continuation answer did not
+// arrive in time. Core is told to stop the turn's execution first (MUYU-160
+// review 7, P1-b): otherwise a continuation still running there keeps the
+// conversation executing, and the user's next question, told the turn failed,
+// is refused as busy. Only once Core confirms (or reports nothing left to stop)
+// does IM end the turn; a stop that cannot complete is retried like any other
+// transient failure, still under this holder's lease.
+func (p *Plugin) endContinuationTimeout(ctx context.Context, row *IMWebhookInbox) error {
+	if err := verifyLease(global.PRISM_DB, row); err != nil {
+		return err
+	}
+	if err := p.stopCoreTurn(ctx, row); err != nil {
+		return err
+	}
+	return p.endTurnWithFailure(ctx, row, "im_continuation_timeout", deterministicClientMessageNo(row.SourceKey, 0))
+}
+
+type turnStopRequest struct {
+	SourceKey            string          `json:"sourceKey"`
+	ExecutionOwnerUserID uint            `json:"executionOwnerUserId"`
+	AgentUID             uint            `json:"agentUid"`
+	Channel              dispatchChannel `json:"channel"`
+}
+
+// stopCoreTurn asks Core to stop the execution of this IM turn. Core binds the
+// stop to the turn's source key and ignores it once a newer turn was admitted,
+// so it cannot cancel the conversation's next question.
+func (p *Plugin) stopCoreTurn(ctx context.Context, row *IMWebhookInbox) error {
+	token, err := p.serviceToken()
+	if err != nil {
+		return err
+	}
+	err = doJSON(ctx, http.MethodPost, p.coreURL+"/api/v1/addons/conversation/im-turn-stop", token, turnStopRequest{
+		SourceKey: row.SourceKey, ExecutionOwnerUserID: row.ExecutionOwnerUserID, AgentUID: row.TargetAgentUID,
+		Channel: dispatchChannel{ID: row.ChannelID, Type: int(row.ChannelType)},
+	}, nil)
+	var status *httpStatusError
+	if errors.As(err, &status) && status.code == "im_turn_not_running" {
+		return nil // already over in Core: nothing to stop
+	}
+	if errors.As(err, &status) && status.status < 500 && status.status != http.StatusTooManyRequests {
+		// A refusal (bad request, forbidden) will not change on retry; end the
+		// turn anyway so it never stays processing, and say why in the log.
+		slog.Error("im turn stop refused by Core; ending the IM turn without it",
+			"inbox_id", row.ID, "status", status.status, "code", status.code)
+		return nil
+	}
+	if err != nil {
+		// Transient: the turn is retried, still waiting for this stop.
+		return fmt.Errorf("stop Core turn: %w", err)
 	}
 	return nil
 }
@@ -276,7 +331,15 @@ func persistCoreEventID(row *IMWebhookInbox, id string) error {
 	if next <= current {
 		return nil
 	}
-	if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).
+	if row.State == inboxProcessing {
+		if err := updateLeased(global.PRISM_DB, row, map[string]any{"last_core_event_id": id}); err != nil {
+			return err
+		}
+	} else if err := global.PRISM_DB.Model(&IMWebhookInbox{}).
+		// This holder just ended the turn itself (the lease is released by that
+		// write); the cursor of the terminal event still belongs to the row, and the
+		// lease generation keeps it from touching a later lease of the same row.
+		Where("id = ? AND state = ? AND attempts = ?", row.ID, row.State, row.Attempts).
 		Update("last_core_event_id", id).Error; err != nil {
 		return err
 	}
@@ -288,9 +351,9 @@ func persistSnapshot(row *IMWebhookInbox, answer string) error {
 	if answer == row.CumulativeAnswer {
 		return nil
 	}
-	if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).Updates(map[string]any{
+	if err := updateLeased(global.PRISM_DB, row, map[string]any{
 		"cumulative_answer": answer, "revision": gorm.Expr("revision + 1"),
-	}).Error; err != nil {
+	}); err != nil {
 		return err
 	}
 	row.CumulativeAnswer = answer
@@ -328,13 +391,18 @@ func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMes
 // only once WuKong accepted the message.
 func (p *Plugin) endTurnWithFailure(ctx context.Context, row *IMWebhookInbox, code, clientNo string) error {
 	now := time.Now()
-	result := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ? AND state = ?", row.ID, inboxProcessing).Updates(map[string]any{
+	// Only the lease holder may end the turn: a holder that was paused past its
+	// lease and came back must not fail a turn another instance now runs.
+	result := leaseScope(global.PRISM_DB, row).Updates(map[string]any{
 		"state": inboxDead, "last_error_code": code, "lease_owner": "",
 		"lease_expires_at": nil, "next_attempt_at": nil, "final_wu_kong_client_msg_no": clientNo,
 		"notice_due_at": now, "notice_attempts": 0,
 	})
-	if result.Error != nil || result.RowsAffected == 0 {
+	if result.Error != nil {
 		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errLeaseLost
 	}
 	row.State = inboxDead
 	row.FinalWuKongClientMsgNo = clientNo
@@ -382,6 +450,17 @@ func (p *Plugin) deliverNotice(ctx context.Context, row *IMWebhookInbox, now tim
 	if claim.Error != nil || claim.RowsAffected != 1 {
 		return
 	}
+	// The notice is posted as the agent, possibly days after the turn ended, so
+	// the agent's right to post in this channel is re-checked on every attempt
+	// (MUYU-160 review 7, P2). It runs after the claim, like the send: a check
+	// that fails or refuses sends nothing and leaves the notice owed at the
+	// claimed next step, so it is delivered only once posting is allowed again.
+	if allowed, err := noticeDeliveryAllowed(ctx, row); err != nil || !allowed {
+		slog.Warn("im failure notice not sent: the agent may not post in this channel now; kept owed",
+			"inbox_id", current.ID, "agent_uid", row.TargetAgentUID, "channel_type", row.ChannelType,
+			"attempt", current.NoticeAttempts+1, "check_error", err)
+		return
+	}
 	payload, _ := json.Marshal(textPayload{Type: wuKongTextType, Content: execFailedText, SystemNotice: execFailedNotice})
 	if err := postWuKong(ctx, p.apiAddr, "/message/send", map[string]any{
 		"from_uid":   strconv.FormatUint(uint64(row.TargetAgentUID), 10),
@@ -395,6 +474,43 @@ func (p *Plugin) deliverNotice(ctx context.Context, row *IMWebhookInbox, now tim
 	}
 	global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", current.ID).
 		Updates(map[string]any{"notice_due_at": nil, "notice_sent_at": time.Now()})
+}
+
+// noticeDeliveryAllowed is the posting check for a turn's failure notice, the
+// same membership rule ordinary agent posts follow: the agent is still an
+// enabled agent account, and the channel still includes the agent and the person
+// who asked (both group members, or the same direct chat with an enabled user).
+// The notice carries no answer, so dispatch-only checks (execution owner, group
+// allowlist) do not apply.
+func noticeDeliveryAllowed(ctx context.Context, row *IMWebhookInbox) (bool, error) {
+	db := global.PRISM_DB.WithContext(ctx)
+	var agents int64
+	if err := db.Model(&authmodel.User{}).
+		Where("id = ? AND account_type = ? AND enable = ?", row.TargetAgentUID, authmodel.AccountTypeAgent, 1).
+		Count(&agents).Error; err != nil {
+		return false, err
+	}
+	if agents != 1 {
+		return false, nil
+	}
+	switch row.ChannelType {
+	case personChannel:
+		_, peer, ok := canonicalPersonChannel(row.ChannelID, row.SenderUID)
+		if !ok || peer != row.TargetAgentUID {
+			return false, nil
+		}
+		return recipientEnabled(ctx, global.PRISM_DB, row.SenderUID)
+	case groupChannel:
+		for _, uid := range []uint{row.TargetAgentUID, row.SenderUID} {
+			member, err := isGroupMember(ctx, row.ChannelID, uid)
+			if err != nil || !member {
+				return false, err
+			}
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // noticeResendInterval is how often owed notices are checked.

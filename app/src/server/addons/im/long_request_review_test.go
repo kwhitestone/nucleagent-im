@@ -159,7 +159,7 @@ func TestLongRequestFailureNoticeGivesUpAfterSchedule(t *testing.T) {
 	sends := map[string]int{}
 	p.apiAddr = wrapSend(t, &failing, sends)
 	row := longRequestRow(t, db, "give-up-turn", 9)
-	row.Attempts = len(retryDelays) + 1
+	exhaustRetries(t, db, row)
 	p.failInbox(row, errCoreStreamIdle, time.Now())
 	at := time.Now()
 	for range len(noticeRetryDelays) + 3 {
@@ -205,7 +205,7 @@ func TestLongRequestFollowUpAfterEachOutcome(t *testing.T) {
 			first := longRequestRow(t, db, "first", 9)
 			if outcome == "exhausted" {
 				turn.Store(1) // the first turn never reached Core's stream
-				first.Attempts = len(retryDelays) + 1
+				exhaustRetries(t, db, first)
 				p.failInbox(first, errCoreStreamIdle, time.Now())
 			} else if err := p.consumeCoreStream(t.Context(), first); err != nil {
 				t.Fatalf("first: %v", err)

@@ -48,7 +48,7 @@ func TestMultiProcessWorker(t *testing.T) {
 	global.PRISM_DB = db
 	core := os.Getenv(mpCoreEnv)
 	p := &Plugin{apiAddr: core, coreURL: core, serviceJWT: "test-token", done: make(chan struct{})}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 	fmt.Fprintf(os.Stderr, "worker %s pid=%d started\n", os.Getenv(mpNameEnv), os.Getpid())
 	p.runWorker(ctx) // returns on ctx timeout; the parent kills or stops us earlier
@@ -234,4 +234,168 @@ func indexOf(items []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// MUYU-160 review 7 (P1-a): the old holder is not killed but paused (SIGSTOP)
+// past its lease, another process takes the turn over, and then the old holder
+// resumes (SIGCONT) holding an answer it read before the pause. It must neither
+// post that answer nor end the turn; the new holder alone finishes it.
+func TestMultiProcessPausedHolderResumesAfterTakeover(t *testing.T) {
+	if os.Getenv(mpWorkerEnv) == "1" {
+		t.Skip("parent only")
+	}
+	db := mysqlInboxDB(t)
+	if err := db.AutoMigrate(&authmodel.User{}, &model.AgentInstance{}, &model.AgentTemplate{},
+		&IMCoreConversationMap{}, &IMGroupMember{}, &IMMessage{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []struct {
+		id   uint
+		kind string
+	}{{1, authmodel.AccountTypeHuman}, {42, authmodel.AccountTypeAgent}} {
+		if err := db.Create(&authmodel.User{ID: u.id, Username: fmt.Sprint("u", u.id), AccountType: u.kind, Enable: 1}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var schema string
+	db.Raw("SELECT DATABASE()").Scan(&schema)
+
+	var mu sync.Mutex
+	var dispatches, replies []string
+	streams := 0
+	staleAnswer := make(chan struct{}) // releases the answer to the paused holder's stream
+	release := make(chan struct{})     // releases the answer to the new holder's stream
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
+		switch r.URL.Path {
+		case "/channel/messagesync":
+			fmt.Fprint(w, `{"messages":[]}`)
+		case "/message/send":
+			var body noticeSend
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			var text textPayload
+			_ = json.Unmarshal(body.Payload, &text)
+			mu.Lock()
+			replies = append(replies, text.Content)
+			mu.Unlock()
+		case "/api/v1/addons/conversation/im-dispatch":
+			var input dispatchRequest
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			mu.Lock()
+			dispatches = append(dispatches, input.SourceKey)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(dispatchResult{ConversationID: 9, SourceKey: input.SourceKey, Status: "accepted"})
+		case "/api/v1/addons/conversation/9/messages/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			mu.Lock()
+			streams++
+			connection := streams
+			mu.Unlock()
+			emitCoreMessage(w, 7, "user", "text", "long", "a1")
+			gate := release
+			if connection == 1 {
+				gate = staleAnswer // the first holder's connection
+			}
+			if connection <= 2 {
+				select {
+				case <-gate:
+				case <-r.Context().Done():
+					return
+				}
+				emitCoreMessage(w, 8, "agent", "result", "a1 answer", "")
+				flusher.Flush()
+				<-r.Context().Done()
+				return
+			}
+			emitCoreMessage(w, 8, "agent", "result", "a1 answer", "")
+			emitCoreMessage(w, 10, "user", "text", "next", "a2")
+			emitCoreMessage(w, 11, "agent", "result", "a2 answer", "")
+			flusher.Flush()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	a1 := mysqlRow(t, db, "a1", "1@42", 1, inboxPending)
+	a2 := mysqlRow(t, db, "a2", "1@42", 1, inboxPending)
+	start := func(name string) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestMultiProcessWorker$", "-test.v")
+		cmd.Env = append(os.Environ(), mpWorkerEnv+"=1", mpSchemaEnv+"="+schema, mpCoreEnv+"="+server.URL, mpNameEnv+"="+name)
+		var out strings.Builder
+		cmd.Stdout, cmd.Stderr = &out, &out
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("started %s pid=%d", name, cmd.Process.Pid)
+		t.Cleanup(func() {
+			_ = cmd.Process.Signal(syscall.SIGCONT)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Logf("%s output:\n%s", name, out.String())
+		})
+		return cmd
+	}
+	streamCount := func() int { mu.Lock(); defer mu.Unlock(); return streams }
+
+	first := start("proc-1")
+	held := waitRow(t, db, a1.ID, func(r IMWebhookInbox) bool {
+		return r.State == inboxProcessing && r.LeaseOwner != "" && r.DispatchCoreMessageID != 0
+	}, 15*time.Second)
+	owner1 := held.LeaseOwner
+	if err := first.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("SIGSTOPped proc-1 (pid %d) holding a1 owner=%s attempts=%d", first.Process.Pid, owner1, held.Attempts)
+	pausedAt := time.Now()
+
+	start("proc-2")
+	taken := waitRow(t, db, a1.ID, func(r IMWebhookInbox) bool { return r.LeaseOwner != "" && r.LeaseOwner != owner1 }, 45*time.Second)
+	t.Logf("a1 taken over by %s after %v (attempts=%d)", taken.LeaseOwner, time.Since(pausedAt).Round(time.Second), taken.Attempts)
+	deadline := time.Now().Add(10 * time.Second)
+	for streamCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("new holder never opened its Core stream")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The paused holder's connection now carries an answer, then it resumes.
+	close(staleAnswer)
+	time.Sleep(500 * time.Millisecond)
+	if err := first.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("SIGCONTed proc-1 after %v paused", time.Since(pausedAt).Round(time.Second))
+	time.Sleep(5 * time.Second) // let the resumed holder act on what it read
+	if r := reloadRow(t, db, a1.ID); r.State != inboxProcessing || r.LeaseOwner != taken.LeaseOwner || r.Attempts != taken.Attempts {
+		t.Fatalf("resumed old holder touched the new holder's turn: state=%s owner=%s attempts=%d", r.State, r.LeaseOwner, r.Attempts)
+	}
+	if r := reloadRow(t, db, a2.ID); r.State != inboxPending {
+		t.Fatalf("a2=%s while the new holder still runs a1", r.State)
+	}
+	mu.Lock()
+	early := append([]string(nil), replies...)
+	mu.Unlock()
+	if len(early) != 0 {
+		t.Fatalf("resumed old holder posted %v", early)
+	}
+
+	close(release)
+	waitRow(t, db, a1.ID, func(r IMWebhookInbox) bool { return r.State == inboxCompleted }, 15*time.Second)
+	waitRow(t, db, a2.ID, func(r IMWebhookInbox) bool { return r.State == inboxCompleted }, 20*time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("dispatches=%v replies=%v", dispatches, replies)
+	if fmt.Sprint(replies) != fmt.Sprint([]string{"a1 answer", "a2 answer"}) {
+		t.Fatalf("replies=%v, want each answer once and in order", replies)
+	}
+	var processing int64
+	db.Model(&IMWebhookInbox{}).Where("state = ?", inboxProcessing).Count(&processing)
+	if processing != 0 {
+		t.Fatalf("processing rows left=%d", processing)
+	}
 }

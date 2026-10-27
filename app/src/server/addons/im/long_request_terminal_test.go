@@ -93,6 +93,15 @@ func emitCoreTool(w http.ResponseWriter, id int, tool, status string) {
 	}
 }
 
+// exhaustRetries makes row's lease generation the last one, in the row and the DB.
+func exhaustRetries(t *testing.T, db *gorm.DB, row *IMWebhookInbox) {
+	t.Helper()
+	row.Attempts = len(retryDelays) + 1
+	if err := db.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).Update("attempts", row.Attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func reloadRow(t *testing.T, db *gorm.DB, id uint) IMWebhookInbox {
 	t.Helper()
 	var row IMWebhookInbox
@@ -199,7 +208,7 @@ func TestLongRequestHeartbeatsKeepStreamAlive(t *testing.T) {
 func TestLongRequestRetryExhaustionPostsFailureNotice(t *testing.T) {
 	p, db, core := longRequestFixture(t)
 	row := longRequestRow(t, db, "exhausted-turn", 9)
-	row.Attempts = len(retryDelays) + 1
+	exhaustRetries(t, db, row)
 	p.failInbox(row, errCoreStreamIdle, time.Now())
 	got := reloadRow(t, db, row.ID)
 	if got.State != inboxDead || got.LeaseOwner != "" || got.LeaseExpiresAt != nil || got.FinalWuKongClientMsgNo == "" {
@@ -223,7 +232,7 @@ func TestLongRequestRetryExhaustionPostsFailureNotice(t *testing.T) {
 func TestLongRequestBusyExhaustionKeepsBusyNoticeOnly(t *testing.T) {
 	p, db, _ := longRequestFixture(t)
 	row := longRequestRow(t, db, "busy-turn", 9)
-	row.Attempts = len(retryDelays) + 1
+	exhaustRetries(t, db, row)
 	p.failInbox(row, &httpStatusError{status: http.StatusConflict, code: conversationBusyCode}, time.Now())
 	if got := reloadRow(t, db, row.ID); got.State != inboxDead || got.FinalWuKongClientMsgNo != "" {
 		t.Fatalf("row=%+v, want dead without the execution failure notice", got)

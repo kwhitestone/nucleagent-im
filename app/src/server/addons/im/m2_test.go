@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -345,7 +345,7 @@ func TestLeaseRecoveryAndRetryExhaustion(t *testing.T) {
 	if leased == nil || leased.LeaseOwner != "new" || leased.Attempts != 2 {
 		t.Fatalf("leased=%+v", leased)
 	}
-	leased.Attempts = len(retryDelays) + 1
+	exhaustRetries(t, db, leased)
 	(&Plugin{}).failInbox(leased, errors.New("network"), time.Now())
 	if err := db.First(&row, row.ID).Error; err != nil {
 		t.Fatal(err)

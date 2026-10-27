@@ -2,6 +2,7 @@ package im
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -109,8 +110,10 @@ func TestExecutionFailurePostsOneDurableNotice(t *testing.T) {
 	if err := p.consumeCoreStream(t.Context(), row); err == nil {
 		t.Fatal("a dead row must not be streamed again")
 	}
-	if err := p.failExecution(t.Context(), row, 9); err != nil {
-		t.Fatal(err)
+	// The turn is over and no longer leased: ending it again is refused as a lost
+	// lease (the worker then leaves the row alone) and posts nothing.
+	if err := p.failExecution(t.Context(), row, 9); !errors.Is(err, errLeaseLost) {
+		t.Fatalf("ending a finished turn again: %v, want errLeaseLost", err)
 	}
 	if n := len(sent()); n != 1 {
 		t.Fatalf("repeated failure events must write once, got %d", n)
