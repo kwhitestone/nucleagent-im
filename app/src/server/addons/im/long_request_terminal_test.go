@@ -37,6 +37,13 @@ func longRequestFixture(t *testing.T) (*Plugin, *gorm.DB, *longRequestCore) {
 	addUser(t, db, 42, authmodel.AccountTypeAgent)
 	core := &longRequestCore{turns: map[string]func(http.ResponseWriter, *http.Request){}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		core.mu.Lock()
+		lifecycle := core.turns[lifecyclePath]
+		core.mu.Unlock()
+		if lifecycle != nil && r.URL.Path == lifecyclePath {
+			lifecycle(w, r) // a test scripts Core's lifecycle decision
+			return
+		}
 		if allowLifecycle(w, r) {
 			return
 		}
