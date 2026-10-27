@@ -228,3 +228,120 @@ func TestMySQLTakeoverPrecedesLaterTurn(t *testing.T) {
 		t.Fatalf("survivor leased %+v, want the expired a1 first", taken)
 	}
 }
+
+// Upgrade path (MUYU-160 acceptance): an inbox table in the pre-MUYU-160 shape
+// (main 18d5bfb: none of the 8 columns) with live rows in every state gains all
+// 8 columns with their defaults when the new model is migrated over it; every
+// row keeps its data, and a pending row is still leased and served. Each step
+// is timed and bounded, so a slow or stuck step names itself in the log.
+func TestMySQLInboxUpgradeFromPreMUYU160Schema(t *testing.T) {
+	db := mysqlInboxDB(t)
+	columns := []string{"notice_due_at", "notice_attempts", "notice_sent_at", "delegation_started", "continuation_due_at",
+		"core_stop_code", "core_stop_notice", "core_stop_attempts"}
+	// processlist shows what MySQL is doing (and waiting on) right now, from a
+	// separate connection, so a slow step can be told apart from a blocked one.
+	processlist := func() {
+		raw, err := sql.Open("mysql", os.Getenv("IM_TEST_MYSQL_DSN"))
+		if err != nil {
+			t.Logf("processlist: %v", err)
+			return
+		}
+		defer raw.Close()
+		rows, err := raw.Query("SELECT id, command, time, COALESCE(state,''), COALESCE(LEFT(info,120),'') FROM information_schema.processlist WHERE command <> 'Sleep'")
+		if err != nil {
+			t.Logf("processlist: %v", err)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, seconds int64
+			var command, state, info string
+			_ = rows.Scan(&id, &command, &seconds, &state, &info)
+			t.Logf("processlist id=%d command=%s time=%ds state=%q info=%q", id, command, seconds, state, info)
+		}
+	}
+	step := func(name string, run func(ctx context.Context) error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+		defer cancel()
+		start := time.Now()
+		done := make(chan struct{})
+		go func() { // a step still running after 30s shows what MySQL is doing
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Logf("step %s still running after 30s:", name)
+				processlist()
+			}
+		}()
+		err := run(ctx)
+		close(done)
+		t.Logf("step %-22s %v err=%v", name, time.Since(start).Round(time.Millisecond), err)
+		if err != nil {
+			processlist()
+			t.Fatalf("step %s: %v", name, err)
+		}
+	}
+	t.Logf("fixture ready")
+	// Back to the old shape: one ALTER for all 8 columns.
+	step("drop-8-columns", func(ctx context.Context) error {
+		drop := "ALTER TABLE im_webhook_inbox"
+		for i, column := range columns {
+			if i > 0 {
+				drop += ","
+			}
+			drop += " DROP COLUMN " + column
+		}
+		return db.WithContext(ctx).Exec(drop).Error
+	})
+	step("insert-old-rows", func(ctx context.Context) error {
+		for i, state := range []string{inboxPending, inboxProcessing, inboxCompleted, inboxDead, inboxRetryable} {
+			if err := db.WithContext(ctx).Exec("INSERT INTO im_webhook_inbox (event, message_idstr, target_agent_uid, sender_uid, "+
+				"channel_id, channel_type, message_timestamp, text, state, execution_owner_user_id, source_key, cumulative_answer, "+
+				"created_at, updated_at) VALUES ('msg.notify', ?, 42, ?, ?, 1, 0, 'q', ?, ?, ?, ?, NOW(), NOW())",
+				fmt.Sprint("old-", i), 100+i, fmt.Sprintf("%d@42", 100+i), state, 100+i, fmt.Sprint("old-row-", i),
+				fmt.Sprint("answer-", i)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	step("automigrate-new-model", func(ctx context.Context) error {
+		return db.WithContext(ctx).AutoMigrate(&IMWebhookInbox{})
+	})
+	step("columns-present", func(ctx context.Context) error {
+		for _, column := range columns {
+			if !db.WithContext(ctx).Migrator().HasColumn(&IMWebhookInbox{}, column) {
+				return fmt.Errorf("column %s missing after the upgrade", column)
+			}
+		}
+		return nil
+	})
+	step("old-rows-intact", func(ctx context.Context) error {
+		var rows []IMWebhookInbox
+		if err := db.WithContext(ctx).Where("source_key LIKE 'old-row-%'").Order("id").Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) != 5 {
+			return fmt.Errorf("rows after upgrade=%d, want 5", len(rows))
+		}
+		for i, r := range rows {
+			if r.CumulativeAnswer != fmt.Sprint("answer-", i) || r.CoreStopCode != "" || r.CoreStopNotice ||
+				r.CoreStopAttempts != 0 || r.NoticeAttempts != 0 || r.DelegationStarted ||
+				r.NoticeDueAt != nil || r.NoticeSentAt != nil || r.ContinuationDueAt != nil {
+				return fmt.Errorf("row %d after upgrade: %+v", i, r)
+			}
+		}
+		return nil
+	})
+	step("old-pending-row-leased", func(ctx context.Context) error {
+		leased, err := leaseInbox(ctx, db, "w", time.Now())
+		if err != nil {
+			return err
+		}
+		if leased == nil || leased.SourceKey != "old-row-0" {
+			return fmt.Errorf("leased %+v, want the old pending row", leased)
+		}
+		return nil
+	})
+}
