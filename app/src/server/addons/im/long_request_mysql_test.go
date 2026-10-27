@@ -69,10 +69,11 @@ func mysqlRow(t *testing.T, db *gorm.DB, source, channel string, owner uint, sta
 	return row
 }
 
-// The 5 MUYU-160 columns are created by AutoMigrate on MySQL with the declared types.
+// The 8 MUYU-160 columns are created by AutoMigrate on MySQL with the declared types.
 func TestMySQLInboxMigrationAddsNoticeAndContinuationColumns(t *testing.T) {
 	db := mysqlInboxDB(t)
-	for _, column := range []string{"notice_due_at", "notice_attempts", "notice_sent_at", "delegation_started", "continuation_due_at"} {
+	for _, column := range []string{"notice_due_at", "notice_attempts", "notice_sent_at", "delegation_started", "continuation_due_at",
+		"core_stop_code", "core_stop_notice", "core_stop_attempts"} {
 		if !db.Migrator().HasColumn(&IMWebhookInbox{}, column) {
 			t.Fatalf("column %s missing after AutoMigrate", column)
 		}
