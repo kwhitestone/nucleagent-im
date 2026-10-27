@@ -24,6 +24,20 @@ func allowLifecycle(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// stopConfirmingCore answers /im-turn-stop with success (and lifecycle allow),
+// as a deployed Core does once a refused, Core-admitted turn is stopped.
+func stopConfirmingCore(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowLifecycle(w, r) {
+			return
+		}
+		fmt.Fprint(w, `{"stopped":true}`)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
 func lifecycleGroup(t *testing.T, db *gorm.DB, members ...uint) {
 	t.Helper()
 	if err := db.Create(&IMGroup{GroupID: "g1", CreatorUID: 1}).Error; err != nil {
@@ -170,7 +184,8 @@ func TestLifecycleParticipantRecheck(t *testing.T) {
 func TestLifecyclePolicyFailureIsNeverLeasedAfterRestore(t *testing.T) {
 	db := m2DB(t)
 	row := lifecycleRow(t, db)
-	p := &Plugin{}
+	// A refused turn Core accepted ends once Core confirms its run is stopped.
+	p := &Plugin{coreURL: stopConfirmingCore(t), serviceJWT: "test-token"}
 	p.failInbox(&row, &httpStatusError{status: 409, code: "im_agent_lifecycle_stale"}, time.Now())
 	leased, err := leaseInbox(t.Context(), db, "next", time.Now().Add(time.Hour))
 	if err != nil || leased != nil {
@@ -211,9 +226,13 @@ func TestLifecycleRechecksDuringCoreStream(t *testing.T) {
 	}))
 	defer server.Close()
 	p := &Plugin{coreURL: server.URL, apiAddr: server.URL, serviceJWT: "test-token"}
-	if err := p.consumeCoreStream(t.Context(), &row); err == nil {
+	err := p.consumeCoreStream(t.Context(), &row)
+	if err == nil {
 		t.Fatal("stream continued after lifecycle revocation")
 	}
+	// The worker's single exit ends the refused turn after Core's stop (the
+	// fixture's default route confirms it); the refusal itself never posts.
+	p.failInbox(&row, err, time.Now())
 	if err := db.First(&row, row.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -297,6 +316,11 @@ func TestLifecycleLocalRevocationDuringCoreCheck(t *testing.T) {
 func TestLifecycleRestoreRejectsOldAdmissionButAllowsNew(t *testing.T) {
 	db := m2DB(t)
 	old := lifecycleRow(t, db)
+	// Restored old work that is still queued (never dispatched to Core).
+	old.CoreConversationID, old.DispatchCoreMessageID = 0, 0
+	if err := db.Model(&old).Updates(map[string]any{"core_conversation_id": 0, "dispatch_core_message_id": 0}).Error; err != nil {
+		t.Fatal(err)
+	}
 	barrier := old.CreatedAt.Add(time.Minute)
 	checks := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

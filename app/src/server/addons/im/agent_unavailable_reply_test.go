@@ -226,7 +226,7 @@ func TestAgentUnavailableDeadLetterReplyWithinWindow(t *testing.T) {
 	_, count := noticeServer(t, false)
 	row := lifecycleRow(t, db)
 	addNoticeDefinition(t, db, 42, "stopped")
-	p := &Plugin{}
+	p := &Plugin{coreURL: stopConfirmingCore(t), serviceJWT: "test-token"}
 	disabled := &httpStatusError{status: http.StatusForbidden, code: "im_agent_binding_disabled"}
 	p.failInbox(&row, disabled, fixedNoticeTime)
 	if count() != 1 {

@@ -37,11 +37,14 @@ func TestRefusedHolderPausedThenTakenOverCannotEndTurn(t *testing.T) {
 	if got.State != inboxProcessing || got.LeaseOwner != taken.LeaseOwner || got.Attempts != taken.Attempts {
 		t.Fatalf("stale refusal ended the new holder's turn: %+v", got)
 	}
-	// The new holder sees the same refusal and ends its own turn.
+	// The new holder sees the same refusal and ends its own turn through the
+	// worker's exit, which stops the Core run first (review 9).
 	var denied *httpStatusError
-	if err := p.checkDelivery(t.Context(), &taken); !errors.As(err, &denied) {
+	err = p.checkDelivery(t.Context(), &taken)
+	if !errors.As(err, &denied) {
 		t.Fatalf("new holder refusal: %v", err)
 	}
+	p.failInbox(&taken, err, time.Now())
 	if got := reloadRow(t, db, row.ID); got.State != inboxDead || got.LastErrorCode != "im_recipient_disabled" {
 		t.Fatalf("new holder could not end its refused turn: %+v", got)
 	}

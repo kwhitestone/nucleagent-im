@@ -22,13 +22,19 @@ func (p *Plugin) checkDelivery(ctx context.Context, row *IMWebhookInbox) error {
 	var denied *httpStatusError
 	if errors.As(err, &denied) && denied.status >= 400 && denied.status < 500 &&
 		denied.status != http.StatusTooManyRequests {
+		// A policy refusal: nothing of this turn may be delivered any more.
+		refusal := &deliveryRefusal{denied}
 		// Keep completed history intact; a restore must not revive unsent work.
-		// The row is ended only as the caller saw it (state, holder and lease
-		// generation): a holder that was paused after the refusal and came back
-		// once another instance took the turn over must not end that turn
-		// (MUYU-160 review 8).
+		// The row is ended here only as the caller saw it (state, holder and
+		// lease generation), and only while Core holds nothing for it: a turn
+		// Core accepted, owes a Core stop, or has a claimed answer is ended by
+		// the worker's single exit (failInbox), which stops the Core run first
+		// and never delivers after a refusal (MUYU-160 reviews 8 and 9).
 		result := global.PRISM_DB.WithContext(ctx).Model(&IMWebhookInbox{}).
 			Where("id = ? AND state = ? AND lease_owner = ? AND attempts = ?", row.ID, row.State, row.LeaseOwner, row.Attempts).
+			// last_core_event_id is seeded right before the first dispatch, so an
+			// empty cursor means Core never saw this turn.
+			Where("core_conversation_id = 0 AND core_stop_code = '' AND COALESCE(last_core_event_id, '') = '' AND (final_core_message_id IS NULL OR final_core_message_id = 0)").
 			Where("state IN ?", []string{inboxPending, inboxProcessing, inboxRetryable}).
 			Updates(map[string]any{
 				"state": inboxDead, "last_error_code": denied.code, "lease_owner": "",
@@ -37,17 +43,31 @@ func (p *Plugin) checkDelivery(ctx context.Context, row *IMWebhookInbox) error {
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected == 0 && row.State == inboxProcessing {
-			// Not ended by this call: either it is already over (the refusal
-			// stands), or another holder runs the turn now (leave it alone).
+		if result.RowsAffected == 0 && row.State == inboxProcessing && verifyLease(global.PRISM_DB, row) != nil {
+			// Not ended by this call and not ours any more: either it is already
+			// over (the refusal stands) or another holder runs it (leave it alone).
 			var current IMWebhookInbox
 			if global.PRISM_DB.WithContext(ctx).Select("state").First(&current, row.ID).Error == nil &&
 				(current.State == inboxProcessing || current.State == inboxPending || current.State == inboxRetryable) {
 				return errLeaseLost
 			}
 		}
+		return refusal
 	}
 	return err
+}
+
+// deliveryRefusal marks a policy refusal (agent stopped, recipient disabled,
+// lifecycle stale, ...): the turn ends without delivering anything, not even an
+// answer that was already claimed. It is distinct from a transport failure of
+// WuKong (an answer whose post failed stays owed and is resent).
+type deliveryRefusal struct{ *httpStatusError }
+
+func (e *deliveryRefusal) Unwrap() error { return e.httpStatusError }
+
+func isDeliveryRefusal(err error) bool {
+	var refusal *deliveryRefusal
+	return errors.As(err, &refusal)
 }
 
 func (p *Plugin) deliveryAllowed(ctx context.Context, row *IMWebhookInbox) error {

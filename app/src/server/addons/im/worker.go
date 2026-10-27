@@ -263,10 +263,18 @@ func (p *Plugin) processLeased(ctx context.Context, row *IMWebhookInbox) {
 		keepLease(turnCtx, row, stopTurn)
 	}()
 	var err error
-	if row.CoreStopCode != "" {
+	claimed, claimErr := claimedAnswer(row)
+	switch {
+	case claimErr != nil:
+		err = claimErr
+	case row.CoreStopCode != "":
 		// A turn IM already gave up on: only its owed Core stop remains.
 		err = p.giveUpTurn(turnCtx, row, row.CoreStopCode, row.CoreStopNotice)
-	} else {
+	case claimed:
+		// The answer was claimed but its post never landed: deliver it, never
+		// dispatch the question again (MUYU-160 review 9).
+		err = p.sendFinal(turnCtx, row, 0, "")
+	default:
 		err = p.dispatchAndStream(turnCtx, row)
 	}
 	lost := errors.Is(err, errLeaseLost) || errors.Is(context.Cause(turnCtx), errLeaseLost)
@@ -544,15 +552,40 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		updates["notice_due_at"] = now
 		updates["notice_attempts"] = 0
 	}
-	if updates["state"] == inboxDead && retryable && code != conversationBusyCode && row.CoreConversationID != 0 {
-		// IM gives up on a turn Core accepted and may still be running (its stream
-		// kept dropping). The turn ends only once Core confirms the run is stopped;
-		// until then the stop is a durable debt retried on later leases, so the
-		// next question is never sent into a conversation Core still holds busy
-		// (MUYU-160 review 8). A claimed answer is delivered instead of failing.
+	// A claimed answer is owed to the chat (MUYU-160 review 9): a post that
+	// failed — 5xx, a network error, or a 4xx from WuKong itself — keeps the
+	// turn open and is retried on later leases. Only a policy refusal (the
+	// recipient or agent may no longer be served) ends it without delivering.
+	if claimed, claimErr := claimedAnswer(row); claimErr == nil && claimed && !isDeliveryRefusal(err) {
+		attempt := max(row.Attempts-1, 0)
+		delay := coreStopRetryDelays[min(attempt, len(coreStopRetryDelays)-1)]
+		level := slog.LevelWarn
+		if attempt+1 >= len(coreStopRetryDelays) {
+			level = slog.LevelError
+		}
+		slog.Log(context.Background(), level, "im claimed answer not delivered yet; retrying",
+			"inbox_id", row.ID, "attempt", attempt+1, "next_in", delay, "error", err)
+		leaseScope(global.PRISM_DB, row).Updates(map[string]any{
+			"state": inboxRetryable, "lease_owner": "", "lease_expires_at": nil,
+			"next_attempt_at": now.Add(delay), "last_error_code": "im_answer_delivery_pending",
+		})
+		return
+	}
+	if updates["state"] == inboxDead && code != conversationBusyCode &&
+		(row.CoreConversationID != 0 || row.CoreStopCode != "" || row.LastCoreEventID != "") {
+		// Every way a turn Core accepted can end — retries exhausted, an SSE or
+		// delivery refusal, a stale lifecycle — goes through here (MUYU-160 review
+		// 9): it ends only once Core confirms the run is stopped; until then the
+		// stop is a durable debt retried on later leases, so the next question is
+		// never sent into a conversation Core still holds busy. A refusal only
+		// forbids delivery; it never releases Core silently.
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := p.giveUpTurn(stopCtx, row, code, exhausted)
+		giveUpCode := code
+		if isDeliveryRefusal(err) {
+			giveUpCode = refusedPrefix + code
+		}
+		err := p.giveUpTurn(stopCtx, row, giveUpCode, exhausted)
 		switch {
 		case err == nil:
 			if !exhausted && row.State == inboxDead {

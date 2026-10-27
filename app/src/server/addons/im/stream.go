@@ -446,6 +446,11 @@ func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMes
 	return p.endTurnWithFailure(ctx, row, "im_execution_failed", deterministicClientMessageNo(row.SourceKey, coreMessageID))
 }
 
+// refusedPrefix marks a give-up caused by a policy refusal in core_stop_code
+// (persisted, so it survives re-leases): such a turn ends without delivering
+// anything, not even an answer it had claimed (MUYU-160 review 9).
+const refusedPrefix = "refused:"
+
 // endTurnWithFailure moves a processing turn to dead and owes its durable
 // notice in the same write, so a WuKong outage can delay the notice but never
 // lose it (MUYU-160): deliverNotice and the worker's resend loop clear the debt
@@ -466,8 +471,15 @@ func (p *Plugin) endTurnWithFailure(ctx context.Context, row *IMWebhookInbox, co
 	// turn has one outcome: if an earlier holder already claimed the answer, that
 	// answer is delivered instead of a failure notice (MUYU-160 review 8), so the
 	// chat never receives both.
-	result := leaseScope(global.PRISM_DB, row).
-		Where("final_core_message_id IS NULL OR final_core_message_id = 0").Updates(updates)
+	refused := strings.HasPrefix(code, refusedPrefix)
+	if refused {
+		updates["last_error_code"] = strings.TrimPrefix(code, refusedPrefix)
+	}
+	scope := leaseScope(global.PRISM_DB, row)
+	if !refused {
+		scope = scope.Where("final_core_message_id IS NULL OR final_core_message_id = 0")
+	}
+	result := scope.Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -747,7 +759,9 @@ func (p *Plugin) sendAgentSnapshots(ctx context.Context, writer io.Writer, flush
 			seen[rows[i].ID] = signature
 			continue
 		}
-		if err := p.checkDelivery(ctx, &rows[i]); err != nil {
+		// The browser stream only reads: it never ends a turn (the worker holding
+		// the lease does, after stopping the Core run; MUYU-160 review 9).
+		if err := p.deliveryAllowed(ctx, &rows[i]); err != nil {
 			var denied *httpStatusError
 			if errors.As(err, &denied) && denied.status >= 400 && denied.status < 500 &&
 				denied.status != http.StatusTooManyRequests {
