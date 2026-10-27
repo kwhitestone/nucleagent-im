@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -76,21 +78,122 @@ type historyTurn struct {
 	Content     string `json:"content"`
 }
 
+// inboxWorkerSlots bounds how many turns one IM instance runs at once. A long
+// turn (or a delegated turn waiting for its continuation) used to hold the only
+// worker, so every other channel on the instance queued behind it (MUYU-160).
+var inboxWorkerSlots = 8
+
+// inboxLeaseDuration is how long a lease holds without renewal; the holder renews
+// every inboxLeaseRenewInterval. Another instance may take a turn over only after
+// its lease expired.
+var (
+	inboxLeaseDuration      = 30 * time.Second
+	inboxLeaseRenewInterval = 10 * time.Second
+)
+
+// errLeaseLost: this instance no longer holds the turn's lease (another instance
+// took it over, or the holder could not confirm it in time). The turn must stop
+// without writing, sending or ending anything (MUYU-160 review 7).
+var errLeaseLost = errors.New("im turn lease lost")
+
+// leaseScope selects the row only while this holder still owns its lease. Every
+// write a turn makes goes through it, so a holder that was paused past its lease
+// and came back cannot touch a turn another instance now runs. attempts is the
+// lease generation: every lease, takeover included, increments it, so even a
+// re-lease by the same host:pid fences off the earlier holder.
+func leaseScope(db *gorm.DB, row *IMWebhookInbox) *gorm.DB {
+	return db.Model(&IMWebhookInbox{}).
+		Where("id = ? AND state = ? AND lease_owner = ? AND attempts = ?", row.ID, inboxProcessing, row.LeaseOwner, row.Attempts)
+}
+
+// verifyLease reports errLeaseLost unless this holder still owns the row.
+func verifyLease(db *gorm.DB, row *IMWebhookInbox) error {
+	var held int64
+	if err := leaseScope(db, row).Count(&held).Error; err != nil {
+		return err
+	}
+	if held == 0 {
+		return errLeaseLost
+	}
+	return nil
+}
+
+// updateLeased writes to the row only under the holder's lease. Zero affected rows
+// is re-checked, because MySQL reports a write of unchanged values as 0 rows.
+func updateLeased(db *gorm.DB, row *IMWebhookInbox, updates map[string]any) error {
+	result := leaseScope(db, row).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return verifyLease(db, row)
+	}
+	return nil
+}
+
+// renewLease extends the holder's lease from now.
+func renewLease(row *IMWebhookInbox, now time.Time) error {
+	return updateLeased(global.PRISM_DB, row, map[string]any{"lease_expires_at": now.Add(inboxLeaseDuration)})
+}
+
+// inboxTurnKey is the per-conversation serial lock: one IM conversation (channel,
+// agent, owner) never has two turns in flight on this instance, so its turns keep
+// their order while other conversations proceed in parallel.
+type inboxTurnKey struct {
+	channelID   string
+	channelType uint8
+	agentUID    uint
+	ownerUID    uint
+}
+
+func turnKeyOf(row *IMWebhookInbox) inboxTurnKey {
+	return inboxTurnKey{row.ChannelID, row.ChannelType, row.TargetAgentUID, row.ExecutionOwnerUserID}
+}
+
 func (p *Plugin) runWorker(ctx context.Context) {
 	defer close(p.done)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	var (
+		mu       sync.Mutex
+		inFlight = map[inboxTurnKey]bool{}
+		turns    sync.WaitGroup
+	)
+	slots := make(chan struct{}, max(inboxWorkerSlots, 1))
+	defer turns.Wait() // shutdown lets running turns finish their own cancellation
 	for {
-		row, err := leaseInbox(ctx, global.PRISM_DB, p.workerID(), time.Now())
-		if err == nil && row != nil {
-			p.processLeased(ctx, row)
-			continue
-		}
 		select {
+		case slots <- struct{}{}:
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
 		}
+		mu.Lock()
+		busy := make([]inboxTurnKey, 0, len(inFlight))
+		for key := range inFlight {
+			busy = append(busy, key)
+		}
+		mu.Unlock()
+		row, err := leaseInboxExcluding(ctx, global.PRISM_DB, p.workerID(), time.Now(), busy)
+		if err != nil || row == nil {
+			<-slots
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+		key := turnKeyOf(row)
+		mu.Lock()
+		inFlight[key] = true
+		mu.Unlock()
+		turns.Add(1)
+		go func() {
+			defer turns.Done()
+			defer func() { <-slots }()
+			defer func() { mu.Lock(); delete(inFlight, key); mu.Unlock() }()
+			p.processLeased(ctx, row)
+		}()
 	}
 }
 
@@ -100,20 +203,41 @@ func (p *Plugin) workerID() string {
 }
 
 func leaseInbox(ctx context.Context, db *gorm.DB, worker string, now time.Time) (*IMWebhookInbox, error) {
+	return leaseInboxExcluding(ctx, db, worker, now, nil)
+}
+
+// leaseInboxExcluding leases the oldest due row whose conversation has no turn
+// in flight on this instance, so a busy conversation never blocks the others.
+func leaseInboxExcluding(ctx context.Context, db *gorm.DB, worker string, now time.Time, busy []inboxTurnKey) (*IMWebhookInbox, error) {
 	var leased IMWebhookInbox
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		query := tx.Where(
 			"(state IN ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR "+
 				"(state = ? AND lease_expires_at < ?)",
 			[]string{inboxPending, inboxRetryable}, now, inboxProcessing, now,
-		).Order("id ASC")
+		)
+		for _, key := range busy {
+			query = query.Where("NOT (channel_id = ? AND channel_type = ? AND target_agent_uid = ? AND execution_owner_user_id = ?)",
+				key.channelID, key.channelType, key.agentUID, key.ownerUID)
+		}
+		// A conversation's turns run in order on every instance: a turn is never
+		// leased while an earlier turn of the same conversation is still open
+		// (pending, waiting on a retry, or processing anywhere). This also keeps a
+		// later turn from overtaking an earlier one that is in busy-retry backoff.
+		query = query.Where("NOT EXISTS (SELECT 1 FROM im_webhook_inbox AS earlier WHERE "+
+			"earlier.channel_id = im_webhook_inbox.channel_id AND earlier.channel_type = im_webhook_inbox.channel_type AND "+
+			"earlier.target_agent_uid = im_webhook_inbox.target_agent_uid AND "+
+			"earlier.execution_owner_user_id = im_webhook_inbox.execution_owner_user_id AND "+
+			"earlier.id < im_webhook_inbox.id AND earlier.state IN ?)",
+			[]string{inboxPending, inboxRetryable, inboxProcessing})
+		query = query.Order("id ASC")
 		if tx.Dialector.Name() != "sqlite" {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
 		}
 		if err := query.First(&leased).Error; err != nil {
 			return err
 		}
-		expires := now.Add(30 * time.Second)
+		expires := now.Add(inboxLeaseDuration)
 		return tx.Model(&leased).Updates(map[string]any{
 			"state": inboxProcessing, "lease_owner": worker, "lease_expires_at": expires,
 			"attempts": gorm.Expr("attempts + 1"), "next_attempt_at": nil, "last_error_code": "",
@@ -132,30 +256,66 @@ func leaseInbox(ctx context.Context, db *gorm.DB, worker string, now time.Time) 
 }
 
 func (p *Plugin) processLeased(ctx context.Context, row *IMWebhookInbox) {
-	leaseCtx, cancel := context.WithCancel(ctx)
+	turnCtx, stopTurn := context.WithCancelCause(ctx)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-leaseCtx.Done():
-				return
-			case now := <-ticker.C:
-				expires := now.Add(30 * time.Second)
-				global.PRISM_DB.Model(&IMWebhookInbox{}).
-					Where("id = ? AND state = ? AND lease_owner = ?", row.ID, inboxProcessing, row.LeaseOwner).
-					Update("lease_expires_at", expires)
-			}
-		}
+		keepLease(turnCtx, row, stopTurn)
 	}()
-	err := p.dispatchAndStream(ctx, row)
-	cancel()
+	var err error
+	claimed, claimErr := claimedAnswer(row)
+	switch {
+	case claimErr != nil:
+		err = claimErr
+	case row.CoreStopCode != "":
+		// A turn IM already gave up on: only its owed Core stop remains.
+		err = p.giveUpTurn(turnCtx, row, row.CoreStopCode, row.CoreStopNotice)
+	case claimed:
+		// The answer was claimed but its post never landed: deliver it, never
+		// dispatch the question again (MUYU-160 review 9).
+		err = p.sendFinal(turnCtx, row, 0, "")
+	default:
+		err = p.dispatchAndStream(turnCtx, row)
+	}
+	lost := errors.Is(err, errLeaseLost) || errors.Is(context.Cause(turnCtx), errLeaseLost)
+	stopTurn(nil)
+	if errors.Is(err, errTurnStopPending) {
+		return // parked for the next stop attempt
+	}
+	if lost {
+		// Another instance owns the turn now; it alone may end, retry or answer it.
+		slog.Warn("im turn lease lost; leaving the turn to its new holder",
+			"inbox_id", row.ID, "lease_owner", row.LeaseOwner)
+		return
+	}
 	if err == nil {
 		return
 	}
 	p.failInbox(row, err, time.Now())
+}
+
+// keepLease renews the turn's lease and stops the turn as soon as the lease is
+// lost, or cannot be confirmed for so long that it may have expired: a paused
+// holder must not keep running a turn another instance may already have taken.
+func keepLease(ctx context.Context, row *IMWebhookInbox, stopTurn context.CancelCauseFunc) {
+	ticker := time.NewTicker(inboxLeaseRenewInterval)
+	defer ticker.Stop()
+	renewed := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			err := renewLease(row, now)
+			switch {
+			case err == nil:
+				renewed = now
+			case errors.Is(err, errLeaseLost), now.Sub(renewed) >= inboxLeaseDuration-inboxLeaseRenewInterval:
+				stopTurn(errLeaseLost)
+				return
+			}
+		}
+	}
 }
 
 func (p *Plugin) dispatchAndStream(ctx context.Context, row *IMWebhookInbox) error {
@@ -173,13 +333,18 @@ func (p *Plugin) dispatchAndStream(ctx context.Context, row *IMWebhookInbox) err
 		if cursor == "" {
 			cursor = "0"
 		}
-		if err := global.PRISM_DB.Model(row).Update("last_core_event_id", cursor).Error; err != nil {
+		if err := updateLeased(global.PRISM_DB, row, map[string]any{"last_core_event_id": cursor}); err != nil {
 			return err
 		}
 		row.LastCoreEventID = cursor
 	}
 	history, err := p.initialHistory(ctx, row)
 	if err != nil {
+		return err
+	}
+	// The lease is re-checked right before Core is asked to run: a holder that
+	// lost it must not start (or restart) Core work for a turn it no longer owns.
+	if err := verifyLease(global.PRISM_DB, row); err != nil {
 		return err
 	}
 	result, err := p.dispatchCore(ctx, row, history)
@@ -189,10 +354,10 @@ func (p *Plugin) dispatchAndStream(ctx context.Context, row *IMWebhookInbox) err
 	row.CoreConversationID = result.ConversationID
 	now := time.Now()
 	if err := global.PRISM_DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(row).Updates(map[string]any{
+		if err := updateLeased(tx, row, map[string]any{
 			"core_conversation_id": result.ConversationID,
-			"lease_expires_at":     now.Add(30 * time.Second),
-		}).Error; err != nil {
+			"lease_expires_at":     now.Add(inboxLeaseDuration),
+		}); err != nil {
 			return err
 		}
 		mapping := IMCoreConversationMap{
@@ -367,8 +532,85 @@ func (p *Plugin) failInbox(row *IMWebhookInbox, err error, now time.Time) {
 		updates["state"] = inboxRetryable
 		updates["next_attempt_at"] = now.Add(retryDelays[row.Attempts-1])
 	}
-	global.PRISM_DB.Model(&IMWebhookInbox{}).
-		Where("id = ? AND lease_owner = ?", row.ID, row.LeaseOwner).Updates(updates)
+	// MUYU-160: a turn that ran out of retries on an infrastructure failure (Core
+	// stream dropped or idle, 5xx) used to go dead with no reply at all.
+	// A stopped or deleted agent keeps its own notice below. The client number is
+	// recorded only when this notice is really sent: the browser hands its live
+	// error line over to the durable message that carries it.
+	exhausted := retryable && updates["state"] == inboxDead && code != conversationBusyCode
+	if exhausted {
+		if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {
+			exhausted = false
+		}
+	}
+	exhaustedClientNo := ""
+	if exhausted {
+		// Core message IDs start at 1, so 0 never collides with a reply's number.
+		exhaustedClientNo = deterministicClientMessageNo(row.SourceKey, 0)
+		updates["final_wu_kong_client_msg_no"] = exhaustedClientNo
+		// Owed in the same write that ends the turn, so a failed send is retried.
+		updates["notice_due_at"] = now
+		updates["notice_attempts"] = 0
+	}
+	// A claimed answer is owed to the chat (MUYU-160 review 9): a post that
+	// failed — 5xx, a network error, or a 4xx from WuKong itself — keeps the
+	// turn open and is retried on later leases. Only a policy refusal (the
+	// recipient or agent may no longer be served) ends it without delivering.
+	if claimed, claimErr := claimedAnswer(row); claimErr == nil && claimed && !isDeliveryRefusal(err) {
+		attempt := max(row.Attempts-1, 0)
+		delay := coreStopRetryDelays[min(attempt, len(coreStopRetryDelays)-1)]
+		level := slog.LevelWarn
+		if attempt+1 >= len(coreStopRetryDelays) {
+			level = slog.LevelError
+		}
+		slog.Log(context.Background(), level, "im claimed answer not delivered yet; retrying",
+			"inbox_id", row.ID, "attempt", attempt+1, "next_in", delay, "error", err)
+		leaseScope(global.PRISM_DB, row).Updates(map[string]any{
+			"state": inboxRetryable, "lease_owner": "", "lease_expires_at": nil,
+			"next_attempt_at": now.Add(delay), "last_error_code": "im_answer_delivery_pending",
+		})
+		return
+	}
+	if updates["state"] == inboxDead && code != conversationBusyCode &&
+		(row.CoreConversationID != 0 || row.CoreStopCode != "" || row.LastCoreEventID != "") {
+		// Every way a turn Core accepted can end — retries exhausted, an SSE or
+		// delivery refusal, a stale lifecycle — goes through here (MUYU-160 review
+		// 9): it ends only once Core confirms the run is stopped; until then the
+		// stop is a durable debt retried on later leases, so the next question is
+		// never sent into a conversation Core still holds busy. A refusal only
+		// forbids delivery; it never releases Core silently.
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		giveUpCode := code
+		if isDeliveryRefusal(err) {
+			giveUpCode = refusedPrefix + code
+		}
+		err := p.giveUpTurn(stopCtx, row, giveUpCode, exhausted)
+		switch {
+		case err == nil:
+			if !exhausted && row.State == inboxDead {
+				if off, err := agentUnavailable(global.PRISM_DB, row.TargetAgentUID); err == nil && off {
+					replyAgentUnavailable(context.Background(), global.PRISM_DB, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
+				}
+			}
+		case errors.Is(err, errTurnStopPending), errors.Is(err, errLeaseLost):
+		default:
+			slog.Warn("im give-up of a turn failed; it stays leased until its lease expires",
+				"inbox_id", row.ID, "error", err)
+		}
+		return
+	}
+	result := leaseScope(global.PRISM_DB, row).Updates(updates)
+	// Only the call that moved this lease's row posts anything; a stale holder,
+	// whose turn another instance took over, ends here without a notice.
+	if result.Error != nil || result.RowsAffected != 1 {
+		return
+	}
+	if exhausted {
+		row.FinalWuKongClientMsgNo = exhaustedClientNo
+		p.deliverNotice(context.Background(), row, now)
+		return
+	}
 	if updates["state"] == inboxDead && code == conversationBusyCode {
 		// ponytail: retry order is not first-come-first-served; a per-(group,agent,owner) lease is P1.
 		replyNotice(context.Background(), global.PRISM_DB, busyTimeoutScope, busyTimeoutText, row.ChannelType, row.ChannelID, row.TargetAgentUID, now)
@@ -438,10 +680,20 @@ func deterministicClientMessageNo(sourceKey string, coreMessageID uint) string {
 	return "im-" + hex.EncodeToString(sum[:16])
 }
 
+// sendFinal delivers the turn's answer. A turn has exactly one outcome
+// (MUYU-160 review 8): the answer is first CLAIMED on the row under the
+// holder's lease (final_core_message_id, client number and text, written once
+// and never changed), and only then sent. Every failure path of a turn refuses
+// to end a turn whose answer is claimed and delivers that answer instead. So a
+// holder paused between its last lease check and the send can only ever post
+// the claimed answer with the claimed client number — the same message the new
+// holder posts — which WuKong keeps once; it can never contradict a failure
+// notice, because no failure notice is owed for a turn with a claimed answer.
+// coreMessageID 0 means "deliver the answer an earlier holder claimed".
 func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessageID uint, answer string) error {
 	var current IMWebhookInbox
 	if err := global.PRISM_DB.Select(
-		"state", "final_sent_at", "final_wu_kong_client_msg_no", "cumulative_answer", "revision",
+		"state", "final_sent_at", "final_wu_kong_client_msg_no", "final_core_message_id", "cumulative_answer", "revision",
 	).
 		First(&current, row.ID).Error; err != nil {
 		return err
@@ -452,24 +704,44 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 	if err := p.checkDelivery(ctx, row); err != nil {
 		return err
 	}
-	if row.FinalWuKongClientMsgNo == "" {
-		row.FinalWuKongClientMsgNo = current.FinalWuKongClientMsgNo
+	if err := verifyLease(global.PRISM_DB, row); err != nil {
+		return err
 	}
 	row.CumulativeAnswer = current.CumulativeAnswer
 	row.Revision = current.Revision
-	if err := persistSnapshot(row, answer); err != nil {
-		return err
-	}
-	clientNo := row.FinalWuKongClientMsgNo
-	if clientNo == "" {
-		clientNo = deterministicClientMessageNo(row.SourceKey, coreMessageID)
-		if err := global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).Updates(map[string]any{
-			"final_wu_kong_client_msg_no": clientNo, "final_core_message_id": coreMessageID,
-			"cumulative_answer": answer,
-		}).Error; err != nil {
-			return err
+	if current.FinalCoreMessageID == 0 || current.FinalWuKongClientMsgNo == "" {
+		if coreMessageID == 0 {
+			return errors.New("no claimed answer to deliver")
 		}
-		row.FinalWuKongClientMsgNo = clientNo
+		clientNo := deterministicClientMessageNo(row.SourceKey, coreMessageID)
+		result := leaseScope(global.PRISM_DB, row).
+			Where("final_core_message_id IS NULL OR final_core_message_id = 0").
+			Updates(map[string]any{
+				"final_wu_kong_client_msg_no": clientNo, "final_core_message_id": coreMessageID,
+				"cumulative_answer": answer, "revision": gorm.Expr("revision + 1"),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			if err := verifyLease(global.PRISM_DB, row); err != nil {
+				return err
+			}
+			if err := global.PRISM_DB.Select("final_wu_kong_client_msg_no", "final_core_message_id", "cumulative_answer").
+				First(&current, row.ID).Error; err != nil {
+				return err
+			}
+		} else {
+			current.FinalWuKongClientMsgNo, current.FinalCoreMessageID, current.CumulativeAnswer = clientNo, coreMessageID, answer
+			row.Revision++
+		}
+	}
+	// The claimed answer is what is delivered, whoever claimed it.
+	clientNo, answer := current.FinalWuKongClientMsgNo, current.CumulativeAnswer
+	row.FinalWuKongClientMsgNo, row.CumulativeAnswer = clientNo, answer
+	// Last ownership check before the answer leaves.
+	if err := verifyLease(global.PRISM_DB, row); err != nil {
+		return err
 	}
 	// Stamp A2A provenance on the durable message so the NEXT webhook hop reads a real
 	// chain id and depth instead of inferring one from history. ViaUID names the agent
@@ -490,10 +762,14 @@ func (p *Plugin) sendFinal(ctx context.Context, row *IMWebhookInbox, coreMessage
 		return err
 	}
 	now := time.Now()
-	return global.PRISM_DB.Model(&IMWebhookInbox{}).Where("id = ?", row.ID).Updates(map[string]any{
+	if err := updateLeased(global.PRISM_DB, row, map[string]any{
 		"state": inboxCompleted, "final_sent_at": now, "lease_owner": "", "lease_expires_at": nil,
-		"next_attempt_at": nil, "last_error_code": "", "cumulative_answer": answer,
-	}).Error
+		"next_attempt_at": nil, "last_error_code": "", "core_stop_code": "",
+	}); err != nil {
+		return err
+	}
+	row.State = inboxCompleted
+	return nil
 }
 
 func scanSSE(response io.Reader, handle func(event, id string, data []byte) (bool, error)) error {

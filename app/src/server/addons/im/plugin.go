@@ -273,7 +273,11 @@ func (p *Plugin) Start(ctx context.Context) error {
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.done = make(chan struct{})
 	go p.runWorker(ctx)
-	p.wg.Add(2)
+	p.wg.Add(3)
+	go func() {
+		defer p.wg.Done()
+		p.runNoticeResender(ctx, noticeResendInterval)
+	}()
 	go p.runGroupRebuild(ctx)
 	go func() {
 		defer p.wg.Done()
