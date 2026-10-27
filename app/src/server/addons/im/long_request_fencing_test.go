@@ -113,15 +113,20 @@ func TestUnconfirmedLeaseStopsTurn(t *testing.T) {
 		opened.Store(true)
 		<-r.Context().Done() // a long run; the turn must end because of the lease
 	}
+	// One connection: the shared-cache SQLite otherwise reports "table is
+	// locked" when the takeover and the worker's renewal write at once.
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
 	row := longRequestRow(t, db, "lost-turn", 9)
-	go func() {
-		for !opened.Load() {
-			time.Sleep(10 * time.Millisecond)
-		}
-		takeOver(t, row) // the renewal now fails: another instance owns the row
-	}()
 	done := make(chan struct{})
 	go func() { p.processLeased(t.Context(), row); close(done) }()
+	// The worker always finishes before the test tears the database down.
+	t.Cleanup(func() { <-done })
+	for !opened.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	takeOver(t, row) // the renewal now fails: another instance owns the row
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
