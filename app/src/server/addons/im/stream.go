@@ -237,10 +237,71 @@ func (p *Plugin) endContinuationTimeout(ctx context.Context, row *IMWebhookInbox
 	if err := verifyLease(global.PRISM_DB, row); err != nil {
 		return err
 	}
-	if err := p.stopCoreTurn(ctx, row); err != nil {
+	// An answer already claimed by an earlier holder is this turn's outcome.
+	if claimed, err := claimedAnswer(row); err != nil || claimed {
+		if err != nil {
+			return err
+		}
+		return p.sendFinal(ctx, row, 0, "")
+	}
+	return p.giveUpTurn(ctx, row, "im_continuation_timeout", true)
+}
+
+// errTurnStopPending: the turn was given up on and its Core stop is owed; the
+// row is parked for a later attempt and nothing else may touch it now.
+var errTurnStopPending = errors.New("im turn waits for its Core stop")
+
+// coreStopRetryDelays paces the owed Core stop; the last step repeats until
+// Core confirms (MUYU-160 review 8).
+var coreStopRetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+
+// giveUpTurn ends a turn IM gives up on — but only after Core confirmed that
+// the turn's run is stopped. Until then the give-up is a durable debt on the
+// row (core_stop_code): the row stays open, is parked for a retry, and every
+// later lease retries the stop first (MUYU-160 review 8). The conversation's
+// later turns keep waiting behind it, exactly as Core would refuse them busy.
+func (p *Plugin) giveUpTurn(ctx context.Context, row *IMWebhookInbox, code string, notice bool) error {
+	if row.CoreStopCode == "" {
+		if err := updateLeased(global.PRISM_DB, row, map[string]any{
+			"core_stop_code": code, "core_stop_notice": notice, "core_stop_attempts": 0,
+		}); err != nil {
+			return err
+		}
+		row.CoreStopCode, row.CoreStopNotice, row.CoreStopAttempts = code, notice, 0
+	}
+	stopErr := p.stopCoreTurn(ctx, row)
+	if stopErr == nil {
+		clientNo := ""
+		if row.CoreStopNotice {
+			clientNo = deterministicClientMessageNo(row.SourceKey, 0)
+		}
+		return p.endTurnWithFailure(ctx, row, row.CoreStopCode, clientNo)
+	}
+	attempt := row.CoreStopAttempts
+	delay := coreStopRetryDelays[min(attempt, len(coreStopRetryDelays)-1)]
+	level := slog.LevelWarn
+	if attempt+1 >= len(coreStopRetryDelays) {
+		level = slog.LevelError // Core keeps refusing or is unreachable: needs a look
+	}
+	slog.Log(ctx, level, "im turn given up on, Core stop not confirmed; retrying",
+		"inbox_id", row.ID, "code", row.CoreStopCode, "attempt", attempt+1, "next_in", delay, "error", stopErr)
+	if err := updateLeased(global.PRISM_DB, row, map[string]any{
+		"state": inboxRetryable, "lease_owner": "", "lease_expires_at": nil,
+		"next_attempt_at": time.Now().Add(delay), "last_error_code": "im_core_stop_pending",
+		"core_stop_attempts": attempt + 1,
+	}); err != nil {
 		return err
 	}
-	return p.endTurnWithFailure(ctx, row, "im_continuation_timeout", deterministicClientMessageNo(row.SourceKey, 0))
+	return errTurnStopPending
+}
+
+// claimedAnswer reports whether a holder already claimed this turn's answer.
+func claimedAnswer(row *IMWebhookInbox) (bool, error) {
+	var current IMWebhookInbox
+	if err := global.PRISM_DB.Select("final_wu_kong_client_msg_no", "final_core_message_id").First(&current, row.ID).Error; err != nil {
+		return false, err
+	}
+	return current.FinalWuKongClientMsgNo != "" && current.FinalCoreMessageID != 0, nil
 }
 
 type turnStopRequest struct {
@@ -262,19 +323,14 @@ func (p *Plugin) stopCoreTurn(ctx context.Context, row *IMWebhookInbox) error {
 		SourceKey: row.SourceKey, ExecutionOwnerUserID: row.ExecutionOwnerUserID, AgentUID: row.TargetAgentUID,
 		Channel: dispatchChannel{ID: row.ChannelID, Type: int(row.ChannelType)},
 	}, nil)
+	// Only two answers confirm the turn is over in Core: success, or exactly
+	// 404 im_turn_not_running. Anything else — a plain 404 (route not deployed),
+	// 401/403, 5xx, a network error — leaves the stop owed (MUYU-160 review 8).
 	var status *httpStatusError
-	if errors.As(err, &status) && status.code == "im_turn_not_running" {
-		return nil // already over in Core: nothing to stop
-	}
-	if errors.As(err, &status) && status.status < 500 && status.status != http.StatusTooManyRequests {
-		// A refusal (bad request, forbidden) will not change on retry; end the
-		// turn anyway so it never stays processing, and say why in the log.
-		slog.Error("im turn stop refused by Core; ending the IM turn without it",
-			"inbox_id", row.ID, "status", status.status, "code", status.code)
+	if errors.As(err, &status) && status.status == http.StatusNotFound && status.code == "im_turn_not_running" {
 		return nil
 	}
 	if err != nil {
-		// Transient: the turn is retried, still waiting for this stop.
 		return fmt.Errorf("stop Core turn: %w", err)
 	}
 	return nil
@@ -351,10 +407,15 @@ func persistSnapshot(row *IMWebhookInbox, answer string) error {
 	if answer == row.CumulativeAnswer {
 		return nil
 	}
-	if err := updateLeased(global.PRISM_DB, row, map[string]any{
-		"cumulative_answer": answer, "revision": gorm.Expr("revision + 1"),
-	}); err != nil {
-		return err
+	// Once an answer is claimed it is frozen: a later holder replaying the stream
+	// must deliver exactly the claimed text.
+	result := leaseScope(global.PRISM_DB, row).Where("final_core_message_id IS NULL OR final_core_message_id = 0").
+		Updates(map[string]any{"cumulative_answer": answer, "revision": gorm.Expr("revision + 1")})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return verifyLease(global.PRISM_DB, row)
 	}
 	row.CumulativeAnswer = answer
 	row.Revision++
@@ -391,22 +452,36 @@ func (p *Plugin) failExecution(ctx context.Context, row *IMWebhookInbox, coreMes
 // only once WuKong accepted the message.
 func (p *Plugin) endTurnWithFailure(ctx context.Context, row *IMWebhookInbox, code, clientNo string) error {
 	now := time.Now()
-	// Only the lease holder may end the turn: a holder that was paused past its
-	// lease and came back must not fail a turn another instance now runs.
-	result := leaseScope(global.PRISM_DB, row).Updates(map[string]any{
+	updates := map[string]any{
 		"state": inboxDead, "last_error_code": code, "lease_owner": "",
-		"lease_expires_at": nil, "next_attempt_at": nil, "final_wu_kong_client_msg_no": clientNo,
-		"notice_due_at": now, "notice_attempts": 0,
-	})
+		"lease_expires_at": nil, "next_attempt_at": nil, "core_stop_code": "",
+	}
+	if clientNo != "" {
+		updates["final_wu_kong_client_msg_no"] = clientNo
+		updates["notice_due_at"] = now
+		updates["notice_attempts"] = 0
+	}
+	// Only the lease holder may end the turn: a holder that was paused past its
+	// lease and came back must not fail a turn another instance now runs. And a
+	// turn has one outcome: if an earlier holder already claimed the answer, that
+	// answer is delivered instead of a failure notice (MUYU-160 review 8), so the
+	// chat never receives both.
+	result := leaseScope(global.PRISM_DB, row).
+		Where("final_core_message_id IS NULL OR final_core_message_id = 0").Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return errLeaseLost
+		if err := verifyLease(global.PRISM_DB, row); err != nil {
+			return err
+		}
+		return p.sendFinal(ctx, row, 0, "")
 	}
 	row.State = inboxDead
-	row.FinalWuKongClientMsgNo = clientNo
-	p.deliverNotice(ctx, row, now)
+	if clientNo != "" {
+		row.FinalWuKongClientMsgNo = clientNo
+		p.deliverNotice(ctx, row, now)
+	}
 	return nil
 }
 

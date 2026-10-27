@@ -52,6 +52,14 @@ type IMWebhookInbox struct {
 	// continuation answer until ContinuationDueAt, then the turn fails.
 	DelegationStarted bool `gorm:"not null;default:false"`
 	ContinuationDueAt *time.Time
+	// CoreStopCode is set while IM has given up on the turn but Core has not yet
+	// confirmed that the turn's run is stopped (MUYU-160 review 8). The turn stays
+	// open (retryable) and keeps retrying the stop; it ends with this code only
+	// once Core confirms. CoreStopNotice records whether ending it owes the
+	// failure notice, CoreStopAttempts paces the stop retries.
+	CoreStopCode     string `gorm:"size:64;not null;default:''"`
+	CoreStopNotice   bool   `gorm:"not null;default:false"`
+	CoreStopAttempts int    `gorm:"not null;default:0"`
 	// M3 A2A provenance (additive). ChainID identifies the origin chain that this
 	// row belongs to, ChainDepth is 1 for a human-originated trigger and +1 per
 	// agent hop, and OriginSenderUID is the human who started the chain — agent

@@ -3,6 +3,7 @@ package im
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,8 @@ type busyCore struct {
 	busy      int
 	answers   []string
 	script    map[string]string // source key -> "answer" | "delegate-forever" | "fail" | "empty"
+	// stopOverride, when set, may answer /im-turn-stop itself (returns true).
+	stopOverride func(w http.ResponseWriter) bool
 }
 
 func (c *busyCore) handler(t *testing.T) http.HandlerFunc {
@@ -68,6 +71,9 @@ func (c *busyCore) handler(t *testing.T) http.HandlerFunc {
 		case "/api/v1/addons/conversation/im-turn-stop":
 			var input turnStopRequest
 			_ = json.NewDecoder(r.Body).Decode(&input)
+			if c.stopOverride != nil && c.stopOverride(w) {
+				return
+			}
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.stops = append(c.stops, input.SourceKey)
@@ -164,8 +170,8 @@ func TestFollowUpThroughDispatchAfterEachOutcome(t *testing.T) {
 	}
 }
 
-// The stop cannot reach Core: the turn is not ended (no failure notice, still
-// processing for a retry), so IM never claims a turn over while Core runs it.
+// The stop cannot reach Core: the turn is not ended (no failure notice); it is
+// parked with the stop owed, so IM never claims a turn over while Core runs it.
 func TestContinuationTimeoutWaitsForCoreStop(t *testing.T) {
 	previous := coreContinuationWait
 	coreContinuationWait = 100 * time.Millisecond
@@ -182,11 +188,12 @@ func TestContinuationTimeoutWaitsForCoreStop(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	row := longRequestRow(t, db, "stop-down", 9)
-	if err := p.consumeCoreStream(t.Context(), row); err == nil {
-		t.Fatal("turn ended although Core could not be told to stop it")
+	if err := p.consumeCoreStream(t.Context(), row); !errors.Is(err, errTurnStopPending) {
+		t.Fatalf("turn not parked although Core could not be told to stop it: %v", err)
 	}
-	if got := reloadRow(t, db, row.ID); got.State != inboxProcessing || got.NoticeDueAt != nil {
-		t.Fatalf("row=%+v, want still processing for the retry", got)
+	if got := reloadRow(t, db, row.ID); got.State != inboxRetryable || got.CoreStopCode != "im_continuation_timeout" ||
+		got.NoticeDueAt != nil || got.NextAttemptAt == nil {
+		t.Fatalf("row=%+v, want parked with the Core stop owed", got)
 	}
 	if n := len(core.notices()); n != 0 {
 		t.Fatalf("failure notice posted before Core stopped: %d", n)

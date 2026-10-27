@@ -53,6 +53,11 @@ func longRequestFixture(t *testing.T) (*Plugin, *gorm.DB, *longRequestCore) {
 		core.mu.Lock()
 		handler := core.turns[r.URL.Path]
 		core.mu.Unlock()
+		if handler == nil && r.URL.Path == "/api/v1/addons/conversation/im-turn-stop" {
+			// A deployed Core confirms the stop unless a test scripts otherwise.
+			fmt.Fprint(w, `{"stopped":true}`)
+			return
+		}
 		if handler == nil {
 			http.NotFound(w, r)
 			return

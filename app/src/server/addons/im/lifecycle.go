@@ -23,13 +23,28 @@ func (p *Plugin) checkDelivery(ctx context.Context, row *IMWebhookInbox) error {
 	if errors.As(err, &denied) && denied.status >= 400 && denied.status < 500 &&
 		denied.status != http.StatusTooManyRequests {
 		// Keep completed history intact; a restore must not revive unsent work.
-		if updateErr := global.PRISM_DB.WithContext(ctx).Model(&IMWebhookInbox{}).
-			Where("id = ? AND state IN ?", row.ID, []string{inboxPending, inboxProcessing, inboxRetryable}).
+		// The row is ended only as the caller saw it (state, holder and lease
+		// generation): a holder that was paused after the refusal and came back
+		// once another instance took the turn over must not end that turn
+		// (MUYU-160 review 8).
+		result := global.PRISM_DB.WithContext(ctx).Model(&IMWebhookInbox{}).
+			Where("id = ? AND state = ? AND lease_owner = ? AND attempts = ?", row.ID, row.State, row.LeaseOwner, row.Attempts).
+			Where("state IN ?", []string{inboxPending, inboxProcessing, inboxRetryable}).
 			Updates(map[string]any{
 				"state": inboxDead, "last_error_code": denied.code, "lease_owner": "",
 				"lease_expires_at": nil, "next_attempt_at": nil,
-			}).Error; updateErr != nil {
-			return updateErr
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 && row.State == inboxProcessing {
+			// Not ended by this call: either it is already over (the refusal
+			// stands), or another holder runs the turn now (leave it alone).
+			var current IMWebhookInbox
+			if global.PRISM_DB.WithContext(ctx).Select("state").First(&current, row.ID).Error == nil &&
+				(current.State == inboxProcessing || current.State == inboxPending || current.State == inboxRetryable) {
+				return errLeaseLost
+			}
 		}
 	}
 	return err
