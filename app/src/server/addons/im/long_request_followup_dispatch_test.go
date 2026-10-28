@@ -32,7 +32,11 @@ type busyCore struct {
 	stops     []string
 	busy      int
 	answers   []string
-	script    map[string]string // source key -> "answer" | "delegate-forever" | "fail" | "empty"
+	script    map[string]string // source key -> "answer" | "delegate-forever" | "fail" | "empty" | "blocked"
+	// posts records every WuKong /message/send in order (client number, text, notice flag).
+	posts []noticeSend
+	// onStream, when set, runs when a turn's Core stream is opened (the turn was admitted and runs).
+	onStream func(turn string)
 	// stopOverride, when set, may answer /im-turn-stop itself (returns true).
 	stopOverride func(w http.ResponseWriter) bool
 }
@@ -52,6 +56,7 @@ func (c *busyCore) handler(t *testing.T) http.HandlerFunc {
 			_ = json.Unmarshal(body.Payload, &text)
 			c.mu.Lock()
 			c.answers = append(c.answers, text.Content)
+			c.posts = append(c.posts, body)
 			c.mu.Unlock()
 		case "/api/v1/addons/conversation/im-dispatch":
 			var input dispatchRequest
@@ -86,8 +91,11 @@ func (c *busyCore) handler(t *testing.T) http.HandlerFunc {
 			fmt.Fprint(w, `{"stopped":true}`)
 		case "/api/v1/addons/conversation/9/messages/stream":
 			c.mu.Lock()
-			turn, mode := c.current, c.script[c.current]
+			turn, mode, hook := c.current, c.script[c.current], c.onStream
 			c.mu.Unlock()
+			if hook != nil {
+				hook(turn)
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			emitCoreMessage(w, 7, "user", "text", "q", turn)
 			switch mode {
@@ -100,6 +108,10 @@ func (c *busyCore) handler(t *testing.T) http.HandlerFunc {
 			case "fail":
 				c.finish()
 				emitCoreMessage(w, 8, "system", "error", "provider failed", "")
+			case "blocked":
+				// the turn runs in Core but its stream goes silent (no bytes, no pings), like a dropped proxy
+				<-r.Context().Done()
+				return
 			case "delegate-forever":
 				// turn 1 ends empty after a delegation; its continuation keeps the
 				// conversation executing and never answers.
