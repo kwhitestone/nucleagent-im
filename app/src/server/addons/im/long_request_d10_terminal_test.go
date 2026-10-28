@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // MUYU-160 D10 (zero-cost technical track): the three non-success outcomes driven end to end through the real
@@ -17,6 +19,9 @@ import (
 //   3. Core released: not executing any more (the follow-up is not refused as busy);
 //   4. exactly ONE post reaches the chat for the failed turn, carrying the failure notice, under the turn's
 //      deterministic client number (Core error id for an execution error, id 0 for IM's own timeout), no answer;
+//      the row records it as sent (notice_sent_at set, notice_due_at cleared) and a resend pass at a far-future
+//      time posts nothing more (review of 9a26b472: a quiet period alone proved nothing);
+//   6. Core stops: exactly [first] when IM gave the turn up, none when the turn ended in Core on its own;
 //   5. the follow-up is answered once, with its own text, and is not refused.
 // Short clocks and a local fake: this is a technical regression only, never a substitute for the real DEV
 // execution failure, the real 30-minute continuation timeout or any environment acceptance.
@@ -70,14 +75,20 @@ func TestD10TerminalOutcomesThroughWorker(t *testing.T) {
 			if got.CoreStopCode != "" {
 				t.Fatalf("ended row still owes a Core stop: %q", got.CoreStopCode)
 			}
-			// 4. exactly one post for the failed turn: the notice, under the deterministic number
+			// 4. exactly one post for the failed turn: the notice, under the deterministic number. Synchronised on the
+			// row (not on a quiet period): the send is complete only once IM recorded it as sent and owes nothing.
 			wantNo := deterministicClientMessageNo("first", tc.noticeID)
-			waitPosts(t, core, 1, 5*time.Second)
+			sent := waitNoticeSent(t, db, first.ID, 5*time.Second)
+			if sent.NoticeDueAt != nil || sent.FinalWuKongClientMsgNo != wantNo {
+				t.Fatalf("after the send: row=%+v, want notice sent, nothing owed, number %s", sent, wantNo)
+			}
+			// The resender, run at a time far in the future, must find nothing owed and post nothing.
+			p.resendDueNotices(t.Context(), time.Now().Add(365*24*time.Hour))
 			core.mu.Lock()
 			firstPosts := append([]noticeSend(nil), core.posts...)
 			core.mu.Unlock()
 			if len(firstPosts) != 1 || firstPosts[0].ClientMsgNo != wantNo {
-				t.Fatalf("posts for the failed turn=%v, want exactly one under %s", clientNos(firstPosts), wantNo)
+				t.Fatalf("posts for the failed turn=%v (after a far-future resend pass), want exactly one under %s", clientNos(firstPosts), wantNo)
 			}
 			if text := payloadOf(t, firstPosts[0]); text.SystemNotice == "" || strings.Contains(text.Content, "answer") {
 				t.Fatalf("the failed turn's post is not a failure notice: %+v", text)
@@ -89,7 +100,8 @@ func TestD10TerminalOutcomesThroughWorker(t *testing.T) {
 			if ans.CumulativeAnswer != "second answer" || ans.LeaseOwner != "" {
 				t.Fatalf("follow-up=%+v", ans)
 			}
-			waitPosts(t, core, 2, 5*time.Second)
+			// sendFinal posts before it marks the row completed, so the answer is already recorded here.
+			p.resendDueNotices(t.Context(), time.Now().Add(365*24*time.Hour))
 			core.mu.Lock()
 			defer core.mu.Unlock()
 			if core.busy != 0 || core.executing {
@@ -101,26 +113,32 @@ func TestD10TerminalOutcomesThroughWorker(t *testing.T) {
 			if text := payloadOf(t, core.posts[1]); text.Content != "second answer" || text.SystemNotice != "" {
 				t.Fatalf("follow-up post=%+v", text)
 			}
-			if stopped := len(core.stops) == 1 && core.stops[0] == "first"; stopped != tc.stopped {
-				t.Fatalf("Core stops=%v, want stopped=%v", core.stops, tc.stopped)
+			// Exactly the timed-out / given-up turn, exactly once; nothing at all when the turn ended on its own.
+			if tc.stopped {
+				if len(core.stops) != 1 || core.stops[0] != "first" {
+					t.Fatalf("Core stops=%v, want exactly [first]", core.stops)
+				}
+			} else if len(core.stops) != 0 {
+				t.Fatalf("Core stops=%v, want none: the turn ended in Core on its own", core.stops)
 			}
 		})
 	}
 }
 
-func waitPosts(t *testing.T, core *busyCore, n int, within time.Duration) {
+// waitNoticeSent waits until IM recorded the failure notice as sent (notice_sent_at set) and returns the row.
+func waitNoticeSent(t *testing.T, db *gorm.DB, id uint, within time.Duration) IMWebhookInbox {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for {
-		core.mu.Lock()
-		got := len(core.posts)
-		core.mu.Unlock()
-		if got >= n {
-			time.Sleep(200 * time.Millisecond) // a duplicate would land now
-			return
+		var row IMWebhookInbox
+		if err := db.First(&row, id).Error; err != nil {
+			t.Fatal(err)
+		}
+		if row.NoticeSentAt != nil {
+			return row
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("posts=%d after %v, want %d", got, within, n)
+			t.Fatalf("notice not recorded as sent after %v: row=%+v", within, row)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
